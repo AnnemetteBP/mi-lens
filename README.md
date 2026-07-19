@@ -4,6 +4,7 @@
 ### Lens diff interactive heatmap widgets
 ![Lens diff interactive plotting widget: J-Lens vs. Tuned Lens](assets/jlens_tunedlens.png)
 ![Lens diff interactive plotting widget: Logit Lens vs. Tuned Lens](assets/logitlens_tunedlens.png)
+![Lens diff interactive plotting widget: J-Lens vs. Logit Lens](assets/jlens_logitlens.png)
 
 ### Lens diff layer-wise
 ![Gold rank lens diff: J-Lens, Tuned Lens, Logit Lens](assets/gold_rank.png)
