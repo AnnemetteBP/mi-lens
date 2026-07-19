@@ -1,0 +1,71 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mi-lens"
+version = "0.1.0"
+description = "Project-owned lens analysis toolkit with vendored Jacobian Lens and Tuned Lens code"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "mi-lens contributors" }]
+dependencies = [
+    "accelerate>=0.27.0",
+    "datasets>=2.17.1",
+    "flatten-dict>=0.4.1",
+    "huggingface_hub>=0.16.4",
+    "ipywidgets",
+    "numpy",
+    "plotly>=5.13.1",
+    "simple-parsing>=0.1.4",
+    "torch>=2.0,!=2.3.0",
+    "torchdata>=0.6.0",
+    "transformers>=4.38.1",
+    "wandb>=0.15.0",
+    "notebook",
+    "tqdm"
+]
+
+[project.optional-dependencies]
+dev = [
+    "pre-commit",
+    "pytest",
+    "pytest-cov",
+    "pytest-skip-slow",
+    "ruff",
+]
+notebooks = [
+    "ipywidgets",
+]
+slow_tokenizers = [
+    "sentencepiece>=0.1.99",
+]
+transformer_lens = [
+    "transformer-lens>=1.2.2",
+]
+8bit = [
+    "bitsandbytes",
+]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src", "lenses/jacobian_lens", "lenses/tuned_logit_lens"]
+include = ["methods*", "plotting*", "jlens*", "tuned_lens*"]
+namespaces = false
+
+[tool.setuptools.package-data]
+jlens = ["data/*"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = ["E501", "E741"]
+
+[tool.pytest.ini_options]
+log_cli = true
+log_cli_level = "DEBUG"
