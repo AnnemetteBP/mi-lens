@@ -5,5 +5,9 @@ mi_lens.egg-info
 
 =4.2.0
 
+interpretability/
+lenses/geometric_lens/
+llm_latent_language/
+
 tmp/
 private/

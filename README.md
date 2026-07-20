@@ -33,6 +33,90 @@ We compare lenses along three complementary axes:
 
 These metrics are implemented in the local `methods` package and used throughout the notebooks and comparison widgets.
 
+## Reproducible Data Prep
+
+For reproducibility, keep lens fit/train/eval data as fixed JSONL exports rather than regenerating slices inside notebooks.
+
+- Load Hugging Face splits in source order and do not shuffle during export.
+- Export more rows than the current pilot run needs, so later scale-up can extend the same split by index instead of sampling a different subset.
+- Keep training/fit data on the dataset `train` split when available, and keep evaluation on `validation` or `test`.
+- Store source indices and a manifest hash beside each JSONL file.
+- A simple repository layout is:
+  `data/train_fit` for plain-text lens fit/train exports and `data/eval` for held-out evaluation exports.
+
+The local `methods` package includes helpers for this:
+
+```python
+from pathlib import Path
+
+from methods import (
+    MKQAExportSpec,
+    TextExportSpec,
+    export_mkqa_to_jsonl,
+    export_text_split_to_jsonl,
+    project_data_paths,
+    write_dataset_registry,
+)
+
+ROOT = Path("/media/am/AM/mi-lens")
+PATHS = project_data_paths(ROOT)
+
+plain_da_manifest = export_text_split_to_jsonl(
+    TextExportSpec(
+        dataset_name="YOUR_DANISH_TEXT_DATASET",
+        split="train",
+        text_field="text",
+        start_idx=0,
+        max_records=5000,
+        output_path=PATHS.train_fit_dir / "plain_da_train_5000.jsonl",
+    )
+)
+
+plain_en_manifest = export_text_split_to_jsonl(
+    TextExportSpec(
+        dataset_name="YOUR_ENGLISH_TEXT_DATASET",
+        split="train",
+        text_field="text",
+        start_idx=0,
+        max_records=5000,
+        output_path=PATHS.train_fit_dir / "plain_en_train_5000.jsonl",
+    )
+)
+
+mkqa_da_manifest = export_mkqa_to_jsonl(
+    MKQAExportSpec(
+        split="validation",
+        question_language="da",
+        answer_language="da",
+        start_idx=0,
+        max_records=1000,
+        output_path=PATHS.eval_dir / "mkqa_da_val_1000.jsonl",
+    )
+)
+
+mkqa_en_manifest = export_mkqa_to_jsonl(
+    MKQAExportSpec(
+        split="validation",
+        question_language="en",
+        answer_language="en",
+        start_idx=0,
+        max_records=1000,
+        output_path=PATHS.eval_dir / "mkqa_en_val_1000.jsonl",
+    )
+)
+
+write_dataset_registry(
+    PATHS.registry_path,
+    [
+        plain_da_manifest,
+        plain_en_manifest,
+        mkqa_da_manifest,
+        mkqa_en_manifest,
+    ],
+    note="Unshuffled fixed exports for lens fit/train/eval.",
+)
+```
+
 ## Install
 
 ```bash

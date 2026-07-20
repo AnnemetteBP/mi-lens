@@ -1,0 +1,94 @@
+{
+  "generated_at_utc": "2026-07-20T09:27:14.297899+00:00",
+  "note": "Fixed unshuffled MKQA train_fit/eval slices with matched DA/EN ranges.",
+  "datasets": [
+    {
+      "kind": "mkqa",
+      "dataset_name": "apple/mkqa",
+      "config_name": null,
+      "split": "train",
+      "output_path": "/media/am/AM/mi-lens/data/train_fit/mkqa_da_trainfit_5000.jsonl",
+      "generated_at_utc": "2026-07-20T09:27:10.024827+00:00",
+      "datasets_version": "5.0.0",
+      "start_idx": 0,
+      "end_idx_exclusive": 5000,
+      "records_written": 4334,
+      "dropped_records": 666,
+      "sha256": "5af7a547e0b19e23195a9e55ac1295331a08caf37117e04ec3d4fef07d311208",
+      "extra": {
+        "question_language": "da",
+        "answer_language": "da",
+        "prompt_prefix": "",
+        "prompt_suffix": "",
+        "dataset_requested": "mkqa",
+        "split_requested": "train"
+      }
+    },
+    {
+      "kind": "mkqa",
+      "dataset_name": "apple/mkqa",
+      "config_name": null,
+      "split": "train",
+      "output_path": "/media/am/AM/mi-lens/data/train_fit/mkqa_en_trainfit_5000.jsonl",
+      "generated_at_utc": "2026-07-20T09:27:11.504114+00:00",
+      "datasets_version": "5.0.0",
+      "start_idx": 0,
+      "end_idx_exclusive": 5000,
+      "records_written": 4334,
+      "dropped_records": 666,
+      "sha256": "1ab2f3ea78e1453ad41d28b189dbe9a2e6a6783a46bdf5bd350fad8fba4f5334",
+      "extra": {
+        "question_language": "en",
+        "answer_language": "en",
+        "prompt_prefix": "",
+        "prompt_suffix": "",
+        "dataset_requested": "mkqa",
+        "split_requested": "train"
+      }
+    },
+    {
+      "kind": "mkqa",
+      "dataset_name": "apple/mkqa",
+      "config_name": null,
+      "split": "train",
+      "output_path": "/media/am/AM/mi-lens/data/eval/mkqa_da_eval_5000.jsonl",
+      "generated_at_utc": "2026-07-20T09:27:12.906602+00:00",
+      "datasets_version": "5.0.0",
+      "start_idx": 5000,
+      "end_idx_exclusive": 10000,
+      "records_written": 2424,
+      "dropped_records": 2576,
+      "sha256": "f85040b4581f870758f0eb554aa5d5b6db081e4ae01a2630ebc58cb69e51be55",
+      "extra": {
+        "question_language": "da",
+        "answer_language": "da",
+        "prompt_prefix": "",
+        "prompt_suffix": "",
+        "dataset_requested": "mkqa",
+        "split_requested": "train"
+      }
+    },
+    {
+      "kind": "mkqa",
+      "dataset_name": "apple/mkqa",
+      "config_name": null,
+      "split": "train",
+      "output_path": "/media/am/AM/mi-lens/data/eval/mkqa_en_eval_5000.jsonl",
+      "generated_at_utc": "2026-07-20T09:27:14.294982+00:00",
+      "datasets_version": "5.0.0",
+      "start_idx": 5000,
+      "end_idx_exclusive": 10000,
+      "records_written": 2424,
+      "dropped_records": 2576,
+      "sha256": "02fa923a56c91812b146acfe4fb0c3014ac4b26c652d65dc7c09970b118272ef",
+      "extra": {
+        "question_language": "en",
+        "answer_language": "en",
+        "prompt_prefix": "",
+        "prompt_suffix": "",
+        "dataset_requested": "mkqa",
+        "split_requested": "train"
+      }
+    }
+  ]
+}

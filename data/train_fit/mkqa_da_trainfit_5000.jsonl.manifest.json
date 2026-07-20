@@ -1,0 +1,22 @@
+{
+  "kind": "mkqa",
+  "dataset_name": "apple/mkqa",
+  "config_name": null,
+  "split": "train",
+  "output_path": "/media/am/AM/mi-lens/data/train_fit/mkqa_da_trainfit_5000.jsonl",
+  "generated_at_utc": "2026-07-20T09:27:10.024827+00:00",
+  "datasets_version": "5.0.0",
+  "start_idx": 0,
+  "end_idx_exclusive": 5000,
+  "records_written": 4334,
+  "dropped_records": 666,
+  "sha256": "5af7a547e0b19e23195a9e55ac1295331a08caf37117e04ec3d4fef07d311208",
+  "extra": {
+    "question_language": "da",
+    "answer_language": "da",
+    "prompt_prefix": "",
+    "prompt_suffix": "",
+    "dataset_requested": "mkqa",
+    "split_requested": "train"
+  }
+}

@@ -71,6 +71,60 @@ Norm = Union[
 ]
 
 
+def _has_key_path(obj: Any, key_path: str) -> bool:
+    """Whether `key_path` can be resolved on `obj`."""
+    try:
+        get_key_path(obj, key_path)
+        return True
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+        return False
+
+
+def detect_architecture(model: Any) -> str:
+    """Detect a few common decoder backbones by structure rather than class name."""
+    if _has_key_path(model, "model.model.layers"):
+        return "model.model"
+    if _has_key_path(model, "model.layers"):
+        return "model"
+    if _has_key_path(model, "base_model.layers"):
+        return "base"
+    if _has_key_path(model, "transformer.h"):
+        return "transformer"
+    if _has_key_path(model, "model.decoder.layers"):
+        return "decoder"
+    return "unknown"
+
+
+def resolve_backbone_path(model: Any, arch: str) -> str:
+    """Resolve the module-list path for a detected architecture."""
+    if arch == "model.model":
+        return "model.model.layers"
+    if arch == "model":
+        return "model.layers"
+    if arch == "base":
+        return "base_model.layers"
+    if arch == "transformer":
+        return "transformer.h"
+    if arch == "decoder":
+        return "model.decoder.layers"
+    raise RuntimeError("Cannot resolve backbone for architecture")
+
+
+def find_final_norm(model: Any) -> Any | None:
+    """Find the final norm module for common decoder layouts."""
+    for key_path in (
+        "model.model.norm",
+        "model.norm",
+        "base_model.norm",
+        "transformer.ln_f",
+        "base_model.final_layer_norm",
+        "model.decoder.final_layer_norm",
+    ):
+        if _has_key_path(model, key_path):
+            return get_key_path(model, key_path)
+    return None
+
+
 def get_unembedding_matrix(model: Model) -> nn.Linear:
     """The final linear tranformation from the model hidden state to the output."""
     if isinstance(model, tr.PreTrainedModel):
@@ -124,7 +178,9 @@ def get_final_norm(model: Model) -> Norm:
     elif isinstance(base_model, models.gemma.modeling_gemma.GemmaModel):
         final_layer_norm = base_model.norm
     else:
-        raise NotImplementedError(f"Unknown model type {type(base_model)}")
+        final_layer_norm = find_final_norm(model)
+        if final_layer_norm is None:
+            raise NotImplementedError(f"Unknown model type {type(base_model)}")
 
     if final_layer_norm is None:
         raise ValueError("Model does not have a final layer norm.")
@@ -173,7 +229,14 @@ def get_transformer_layers(model: Model) -> tuple[str, th.nn.ModuleList]:
     elif isinstance(base_model, models.gemma.modeling_gemma.GemmaModel):
         path_to_layers += ["layers"]
     else:
-        raise NotImplementedError(f"Unknown model type {type(base_model)}")
+        arch = detect_architecture(model)
+        if arch == "unknown":
+            raise NotImplementedError(f"Unknown model type {type(base_model)}")
+        path = resolve_backbone_path(model, arch)
+        layer_list = get_key_path(model, path)
+        if not isinstance(layer_list, th.nn.ModuleList):
+            raise ValueError(f"Resolved layer path {path!r} is not a ModuleList")
+        return path, layer_list
 
     path_to_layers = ".".join(path_to_layers)
     return path_to_layers, get_key_path(model, path_to_layers)
