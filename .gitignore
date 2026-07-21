@@ -4,10 +4,14 @@ mi_lens.egg-info
 .env
 
 =4.2.0
+.codex
 
+nnsight/
 interpretability/
 lenses/geometric_lens/
 llm_latent_language/
-
+saes/sparsity_artifacts_crosscoders/
+PrevToolkit/
 tmp/
 private/
+fake_test_models/

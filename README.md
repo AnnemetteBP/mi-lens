@@ -120,15 +120,33 @@ write_dataset_registry(
 ## Install
 
 ```bash
-pip install -e .
+conda env create -f environment.yml
+conda activate mi-lens
+scripts/install_environment.sh
 ```
 
-This installs the checked-in project package together with the vendored lens packages and local analysis modules, including:
+This creates the supported Python 3.12 environment and installs the checked-in
+project package, including:
 
 - `jlens`
 - `tuned_lens`
-- `plotting`
-- `methods`
+- `mi_lens`
+
+For FlexOlmo/FlexDanish runs that require the project-specific Transformers
+fork, install it into the same environment:
+
+```bash
+scripts/install_environment.sh \
+  --flex-transformers /work/.../transformers
+```
+
+The script prints the loaded `transformers` path and version. Router and lens
+run metadata records the same information. All project caches and RouterInterp
+artifacts are written below `tmp/`.
+
+The vendored `jlens` and `tuned_lens` sources are tracked in this repository.
+Other cloned research repositories are not runtime dependencies until they are
+integrated as pinned Git submodules or vendored sources.
 
 ## Repository Layout
 

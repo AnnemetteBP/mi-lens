@@ -1,0 +1,28 @@
+{
+  "project_root": ".",
+  "model_family": "mistral",
+  "model_variant": "danish",
+  "model_label": "munin_ministral3_8b",
+  "model": {
+    "model_name": "danish-foundation-models/munin-ministral3-8B",
+    "dtype": "bfloat16",
+    "trust_remote_code": false,
+    "low_cpu_mem_usage": true
+  },
+  "dataset_name": "mkqa",
+  "dataset_split_role": "eval",
+  "language": "da",
+  "examples_path": "data/eval/mkqa_da_eval_5000.jsonl",
+  "max_examples": 5000,
+  "max_seq_len": 128,
+  "last_n_positions": 12,
+  "top_k": 8,
+  "surface_top_k": 8,
+  "layer_stride": 1,
+  "include_topk_tokens": true,
+  "include_surface_metrics": true,
+  "save_prompt_artifacts": true,
+  "artifact_dtype": "float32",
+  "tuned_lens_path": "outputs/mistral/tuned_lens/munin_ministral3_8b_da_trainfit",
+  "jlens_lens_path": "outputs/mistral/jlens/munin_ministral3_8b_da_trainfit_lens.pt"
+}

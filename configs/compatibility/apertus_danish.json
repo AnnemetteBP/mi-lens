@@ -1,0 +1,22 @@
+{
+  "project_root": ".",
+  "model_family": "apertus",
+  "model_variant": "danish",
+  "model_label": "munin_apertus_8b",
+  "model": {
+    "model_name": "danish-foundation-models/munin-apertus-8b",
+    "dtype": "bfloat16",
+    "trust_remote_code": false,
+    "low_cpu_mem_usage": true
+  },
+  "prompt_path": "data/eval/mkqa_da_eval_5000.jsonl",
+  "jlens_fit_smoke_prompt_path": "data/train_fit/mkqa_da_trainfit_5000.jsonl",
+  "dataset_name": "mkqa",
+  "language": "da",
+  "max_prompts": 3,
+  "jlens_fit_smoke_num_prompts": 16,
+  "max_seq_len": 128,
+  "last_n_positions": 2,
+  "top_k": 8,
+  "test_tuned_from_model": true
+}

@@ -1,0 +1,593 @@
+MI-LENS EXECUTION PLAN
+
+max length, we need to tokenize the dataset and set the max length to longest tokenized sequence to make sure all are apllied to the full prompts regardless of danish or english or individual model tokenizers.
+
+Goal
+- Prepare a reusable workflow for:
+  - model compatibility checks
+  - J-lens fitting
+  - tuned-lens training
+  - plain logit-lens capture
+  - downstream lens-vs-lens and base-vs-Danish analysis
+- Keep all paths project-relative so the same scripts work on UCloud / SSH runners.
+
+
+1. Project Conventions
+
+Use relative project paths only
+- data/train_fit
+- data/eval
+- tmp/
+- outputs/
+- figures/
+- scripts/
+
+Per-model-family output layout
+- outputs/apertus/
+- outputs/mistral/
+- outputs/qwen/
+
+Inside each model family
+- outputs/<family>/compatibility/
+- outputs/<family>/jlens/
+- outputs/<family>/tuned_lens/
+- outputs/<family>/captures/
+- outputs/<family>/summaries/
+- outputs/<family>/metadata/
+
+Figure layout
+- figures/shared/
+- figures/apertus/
+- figures/mistral/
+- figures/qwen/
+
+
+2. Data Preparation
+
+Data rules
+- Export fixed JSONL files in advance.
+- Do not shuffle at export time.
+- Save more samples than the immediate pilot needs.
+- Keep Danish and English mirrored where possible.
+- Save manifest files and one registry file.
+
+Train/Fit data
+- data/train_fit/<dataset>_da_<splitrole>_<n>.jsonl
+- data/train_fit/<dataset>_en_<splitrole>_<n>.jsonl
+
+Eval data
+- data/eval/<dataset>_da_eval_<n>.jsonl
+- data/eval/<dataset>_en_eval_<n>.jsonl
+
+Required metadata per exported row
+- id / example_id
+- prompt or text
+- language
+- source dataset
+- split requested
+- source index
+
+Required metadata per export
+- dataset name
+- config name if any
+- split requested
+- start index
+- end index exclusive
+- record count
+- dropped count
+- sha256
+
+
+3. Compatibility Checks
+
+Need to test three things separately
+- plain logit lens compatibility
+- tuned-lens compatibility
+- J-lens compatibility
+
+Plain logit lens compatibility
+- HF model loads
+- tokenizer loads
+- final norm and output head accessible
+- hidden states available
+- one small batch runs
+
+Tuned-lens compatibility
+- TunedLens.from_model(hf_model) works for architecture smoke test
+- trained tuned lens loads later with from_model_and_pretrained(...)
+- one small batch runs and emits logits per layer
+
+J-lens compatibility
+- jlens.from_hf(hf_model, tokenizer) works
+- one small fit run starts on exported train_fit prompts
+- if fit starts without architecture error, treat model as fit-compatible
+- if checkpoint is created, inspect n_done / source_layers / next_idx
+
+Compatibility report per model
+- outputs/<family>/compatibility/<model_label>_compatibility.json
+
+
+4. Training / Fitting Scope
+
+For each model family
+- base model
+- Danish-adapted Munin model
+
+Need to fit/train on the same train_fit source per comparable run
+- J-lens fit source = tuned-lens train source
+- language pairing must be explicit
+- sample count must be explicit
+
+Artifacts to save
+- J-lens checkpoint during fit
+- final J-lens lens.pt
+- tuned-lens checkpoint / final directory
+- metadata JSON describing:
+  - model name
+  - tokenizer name
+  - dtype
+  - device
+  - train_fit file(s)
+  - n samples used
+  - seq length
+  - skip / checkpoint settings
+  - date
+
+
+5. Batch Capture
+
+Need one unified long-form capture format for all models and lenses.
+
+Always capture
+- final model logits
+- plain logit-lens logits
+- tuned-lens logits if available
+- J-lens logits if available
+- hidden states needed for downstream hidden-space analysis
+- enough metadata to reconnect tensor artifacts to flat analysis rows
+
+Need two storage layers
+
+Layer A: flat long-form analysis rows
+- metrics computed on the fly
+- top-k ids
+- top-k decoded tokens
+- source token text
+- target token text
+- final top-1 token
+- lens top-1 token
+- references to saved tensor artifacts
+
+Layer B: reusable tensor artifacts
+- final model logits
+- logit-lens logits
+- tuned-lens logits if available
+- J-lens logits if available
+- hidden states / residuals needed for hidden-space comparisons
+
+Tensor artifact strategy
+- save tensors at prompt granularity by default so each prompt has its own reusable artifact file
+- prompt-level artifacts are easier to resume, inspect, debug, and rerun selectively
+- each artifact file gets a stable artifact_id
+- flat rows store artifact_id plus indices needed to recover:
+  - example index
+  - layer index
+  - position index
+  - lens name where relevant
+- use a project-owned format such as:
+  - .pt for exact PyTorch tensors
+  - optional lighter derived exports later if needed
+
+Minimum tensor artifacts to preserve
+- final logits
+- per-lens logits
+- final hidden state / final residual
+- intermediate hidden states or residuals used for plain logit lens
+- J-lens transported residuals if needed for hidden-space comparison
+- tuned-lens transformed hidden states if needed for hidden-space comparison
+
+Reason
+- some downstream analyses need the full logits, not just summary metrics
+- hidden-space metrics require access to actual hidden states / residuals
+- saving both tensor artifacts and flat summaries avoids recomputing expensive runs
+
+Metric computation rules
+- distinguish clearly between:
+  - hidden-space quantities
+  - raw logits
+  - probability distributions after softmax
+- any metric defined on probabilities must be computed from softmaxed logits, not from hidden states
+- any hidden-space metric must explicitly state which hidden state / residual variant it uses
+- preserve enough artifacts to recompute metrics later if needed
+
+Probability rules
+- softmax over vocab dimension only
+- use float32 for probability computations even if model weights are bfloat16 / float16
+- check probability sums are numerically close to 1.0
+- clamp only where mathematically necessary for logs / KL, and record epsilon used
+
+Metric validation and assertions
+- every metric pipeline should include assertions or validation checks
+- fail fast if a metric is outside its valid range unless the metric is explicitly unbounded
+
+Metric taxonomy
+
+Intrinsic single-distribution metrics
+- compute these for every saved prediction distribution:
+  - logit mean
+  - logit std
+  - logit min
+  - logit max
+  - logit top1_top2_gap
+  - probability mean
+  - probability std
+  - entropy
+  - effective support / perplexity-from-probs
+  - top-k mass
+  - top-1 margin
+  - skewness
+  - kurtosis
+
+Pairwise distribution metrics
+- same model, different lenses
+- same lens, different models
+- examples:
+  - KL(P || Q)
+  - KL(Q || P)
+  - JS(P, Q)
+  - TV(P, Q)
+  - top-k Jaccard
+  - gold-token probability difference
+  - final-top1 probability difference
+  - entropy difference
+  - top-1 margin difference
+
+Hidden-space metrics
+- cosine similarity
+- L2
+- relative L2
+- norm ratio
+- any additional residual-space distances we later decide to keep
+
+Fuzzy-trace style metric groups
+- keep the fuzzy-trace framing from the earlier notebooks
+- separate metrics into:
+  - verbatim / exact-token fidelity
+  - gist / surface-form proxy fidelity
+  - mechanistic / hidden-space faithfulness
+
+Verbatim / exact-token metrics
+- top1_exact
+- topk_exact
+- gold_rank
+- gold_prob
+- final_top1_rank
+- final_top1_prob
+- gt_prob_diff
+
+Gist / surface-form proxy metrics
+- top-k Jaccard
+- top1_norm_matches_gold
+- top1_norm_matches_final_top1
+- topk_contains_norm_gold
+- top1_charngram_jaccard_gold
+- top1_charngram_jaccard_final_top1
+- best_topk_charngram_jaccard_gold
+- best_topk_charngram_jaccard_final_top1
+- normalized-form repetition in top-k
+
+Mechanistic / hidden-space metrics
+- cosine similarity to final residual
+- L2 to final residual
+- relative L2 to final residual
+- norm ratio to final residual
+- any later residual-space metrics should state exactly which residual variants are compared
+
+Notebook-derived experimental metrics to preserve
+- the line-plot metrics from the earlier exploratory notebooks should all remain capturable
+- especially:
+  - gold_rank
+  - gold_prob
+  - gt_prob_diff
+  - top-k Jaccard
+  - KL in both directions
+  - JS
+  - TV
+  - entropy
+  - top-1 margin
+  - cosine similarity
+  - relative L2
+
+Hidden-state artifact requirements
+- if we want cosine / L2 / relative L2 later, we must save the exact hidden-state or residual tensors those metrics are based on
+- for plain logit lens:
+  - save intermediate residuals before final unembedding
+- for J-lens:
+  - save both source residuals and transported residuals when needed
+- for tuned lens:
+  - save pre-translation hidden states and translated hidden states when needed
+- always save enough metadata to know which hidden-state variant a metric used
+
+Expected metric domains
+- top1_exact in {0, 1}
+- topk_exact in {0, 1}
+- gold_prob in [0, 1]
+- final_top1_prob in [0, 1]
+- topk_jaccard_vs_final in [0, 1]
+- top1_norm_matches_gold in {0, 1}
+- top1_norm_matches_final_top1 in {0, 1}
+- topk_contains_norm_gold in {0, 1}
+- top1_charngram_jaccard_gold in [0, 1]
+- top1_charngram_jaccard_final_top1 in [0, 1]
+- best_topk_charngram_jaccard_gold in [0, 1]
+- best_topk_charngram_jaccard_final_top1 in [0, 1]
+- js_vs_final >= 0
+- tv_vs_final in [0, 1]
+- kl_vs_final >= 0
+- gold_rank >= 1
+- final_top1_rank >= 1
+- cosine similarity metrics in [-1, 1]
+- relative L2 metrics >= 0
+- L2 metrics >= 0
+- norm ratios >= 0
+- entropy >= 0
+- top-k mass in [0, 1]
+- probability mean in [0, 1]
+- probability std >= 0
+- repetition-style ratios in [0, 1] when normalized that way
+
+Numerical support checks
+- check for NaN / inf in logits before metric computation
+- check for NaN / inf after softmax
+- check tensor shapes before saving
+- assert expected vocab size agreement across final logits and lens logits
+- assert expected layer count where applicable
+
+Capture granularity rules
+- save data per prompt, per layer, per position whenever the quantity is defined at that level
+- only save a single scalar summary when the metric is truly aggregate-only
+- do not collapse per-position data too early
+- keep enough indexing to reconnect aggregate summaries back to row-level and tensor-level artifacts
+
+Decoded output preservation
+- always save top-k token ids
+- always save decoded top-k token strings
+- save source token id and decoded source token
+- save target token id and decoded target token
+- save final top-1 token id and decoded token
+- save lens top-1 token id and decoded token
+- if useful, save normalized decoded token forms used in surface metrics
+
+Top-k structure / repetition support metrics
+- repetition in top-k predictions for a single model/lens should be captured where meaningful
+- examples:
+  - repeated normalized token forms in top-k
+  - repeated whitespace variants / punctuation variants in top-k
+  - duplicate normalized forms ratio in top-k
+- useful especially for fragmented tokenization and low-resource-language analysis
+
+Required row fields
+- model_family
+- model_variant (base / danish)
+- model_label
+- lens_name
+- dataset_name
+- dataset_split_role
+- language
+- example_id
+- prompt
+- layer
+- position
+- source_token_id
+- source_token_text
+- target_token_id
+- target_token_text
+- final_top1_id
+- final_top1_text
+- lens_top1_id
+- lens_top1_text
+- lens_topk_ids
+- lens_topk_tokens
+- top1_exact
+- topk_exact
+- gold_rank
+- gold_prob
+- final_top1_rank
+- final_top1_prob
+- topk_jaccard_vs_final
+- kl_vs_final
+- js_vs_final
+- tv_vs_final
+- kl_final_vs_lens
+- gt_prob_diff
+- final_top1_prob_diff
+- entropy
+- topk_mass
+- top1_margin
+- logit_mean
+- logit_std
+- prob_mean
+- prob_std
+- skewness
+- kurtosis
+- cosine_to_final
+- l2_to_final
+- relative_l2_to_final
+- norm_ratio_to_final
+- artifact_id
+- artifact_example_index
+- artifact_position_index
+- metric_epsilon
+- probability_sum
+- logits_has_nan
+- probs_has_nan
+
+Optional row fields
+- surface-form metrics
+- hidden-space metrics if captured separately
+- artifact_layer_index
+- artifact_lens_name
+- normalized_source_token_text
+- normalized_target_token_text
+- normalized_lens_top1_text
+- normalized_final_top1_text
+
+Artifact outputs
+- outputs/<family>/captures/tensors/
+- outputs/<family>/captures/rows/
+
+Suggested tensor file structure
+- outputs/<family>/captures/tensors/<model_label>_<dataset_role>_<language>_<example_id>.pt
+
+Suggested row file structure
+- outputs/<family>/captures/rows/<model_label>_<dataset_role>_<language>.jsonl
+
+Per-prompt artifact expectations
+- write one tensor artifact file per prompt
+- include in each prompt artifact:
+  - prompt text
+  - example_id
+  - token ids
+  - decoded tokens
+  - final logits
+  - per-lens logits
+  - hidden states / residuals needed later
+  - metadata on dtype, device, model, tokenizer, and capture config
+- write and flush each prompt artifact before moving to the next prompt when feasible
+- this makes partial progress recoverable if a long run stops
+
+Capture outputs
+- outputs/<family>/captures/<model_label>_<dataset_role>_<language>.jsonl
+
+Run isolation / cleanup
+- after finishing one model run, clear in-memory model objects before the next run
+- call gc.collect()
+- call torch.cuda.empty_cache() when running on CUDA
+- if using prompt-level artifact files, finish writing files before cleanup
+- keep cache and output directories model-specific where possible
+- this helps avoid stale state across base-model and Danish-model runs
+
+
+6. Downstream Analysis
+
+Need both comparison directions
+
+Lens-vs-lens within the same model
+- logit vs tuned
+- logit vs jlens
+- tuned vs jlens
+
+Base-vs-Danish within the same lens
+- base vs Danish using logit lens
+- base vs Danish using tuned lens
+- base vs Danish using J-lens
+
+Summary outputs
+- grouped means per lens / language / layer
+- grouped means per model variant / language / layer
+- overall model-family summaries
+- prompt-level heatmap inputs
+- per-layer curve inputs
+
+Minimum summary metrics
+- top1_exact
+- topk_exact
+- gold_rank
+- gold_prob
+- topk_jaccard_vs_final
+- kl_vs_final
+- kl_final_vs_lens
+- js_vs_final
+- tv_vs_final
+- gt_prob_diff
+- entropy
+- topk_mass
+- top1_margin
+- logit_std
+- prob_std
+- cosine_to_final
+- relative_l2_to_final
+- norm_ratio_to_final
+- surface metrics if enabled
+
+Useful analysis views
+- layerwise line plots
+- prompt-position heatmaps
+- lens delta tables
+- base-vs-Danish delta tables
+- shared figure folder for paper-ready cross-family plots
+
+Line-plot friendly metrics to preserve explicitly
+- gold_rank by layer
+- gold_prob by layer
+- gt_prob_diff by layer
+- top-k Jaccard by layer
+- JS by layer
+- KL in both directions by layer
+- TV by layer
+- entropy by layer
+- top-1 margin by layer
+
+
+7. Script Structure To Create
+
+scripts/compatibility/
+- run_model_compatibility.py
+
+scripts/data/
+- export_train_fit_data.py
+- export_eval_data.py
+
+scripts/jlens/
+- fit_jlens.py
+- inspect_jlens_checkpoint.py
+
+scripts/tuned_lens/
+- train_tuned_lens.py
+- inspect_tuned_lens.py
+
+scripts/capture/
+- capture_lens_outputs.py
+
+scripts/analysis/
+- summarize_captures.py
+- compare_lenses.py
+- compare_base_vs_danish.py
+- build_figures.py
+
+scripts/runners/
+- shell wrappers for UCloud / SSH
+- one model at a time
+- one family at a time
+- explicit relative paths only
+
+
+8. Resource / Runtime Hygiene
+
+Before each large run
+- log hostname
+- log torch / transformers versions
+- log dtype
+- log device
+- log cache dir
+
+During runs
+- gc.collect() between major stages where helpful
+- torch.cuda.empty_cache() only when actually on CUDA
+- write checkpoints frequently
+- write metadata sidecars
+
+For notebook use
+- avoid stale kernel state
+- load one large model at a time
+- ensure cache path is set before importing/loading HF assets
+
+
+9. Immediate Next Steps
+
+1. Finalize exact train_fit and eval datasets.
+2. Run compatibility reports on one base model and one Danish model per family.
+3. Confirm J-lens fit-start works on exported train_fit prompts.
+4. Train / fit tuned lens and J-lens on matched train_fit data.
+5. Run unified capture on held-out eval data.
+6. Aggregate lens-vs-lens, base-vs-Danish, and overall summaries.

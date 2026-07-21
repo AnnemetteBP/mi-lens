@@ -1,0 +1,22 @@
+{
+  "project_root": ".",
+  "model_family": "qwen",
+  "model_variant": "danish",
+  "model_label": "munin_qwen3_5_9b",
+  "model": {
+    "model_name": "danish-foundation-models/munin-qwen3.5-9B",
+    "dtype": "bfloat16",
+    "trust_remote_code": false,
+    "low_cpu_mem_usage": true
+  },
+  "dataset_name": "mkqa",
+  "dataset_split_role": "trainfit",
+  "language": "da",
+  "examples_path": "data/train_fit/mkqa_da_trainfit_5000.jsonl",
+  "max_examples": 5000,
+  "max_seq_len": 128,
+  "skip_first": 16,
+  "checkpoint_every": 25,
+  "checkpoint_path": "outputs/qwen/jlens/munin_qwen3_5_9b_da_trainfit_ckpt.pt",
+  "lens_path": "outputs/qwen/jlens/munin_qwen3_5_9b_da_trainfit_lens.pt"
+}

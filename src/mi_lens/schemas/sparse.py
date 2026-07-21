@@ -1,0 +1,1 @@
+"""Sparse-feature schema placeholder."""

@@ -1,0 +1,20 @@
+{
+  "project_root": ".",
+  "model_family": "flexolmo",
+  "model_label": "a4-55b-v2",
+  "model": {
+    "model_name": "FlexOlmo-8x7B-1T-a4-55B-v2",
+    "flexmore_checkpoint": "FlexOlmo-8x7B-1T-a4-55B-v2",
+    "dtype": "bfloat16",
+    "low_cpu_mem_usage": true,
+    "trust_remote_code": true
+  },
+  "examples_path": "data/prepared/train_fit/plain_en_train_5000.jsonl",
+  "output_path": "tmp/routerinterp/flexolmo/a4-55b-v2/train",
+  "dataset_split_role": "train",
+  "layers": [0],
+  "max_examples": 100,
+  "max_seq_len": 256,
+  "skip_first_token": true,
+  "artifact_dtype": "bfloat16"
+}

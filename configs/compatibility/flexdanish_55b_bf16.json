@@ -1,0 +1,20 @@
+{
+  "project_root": ".",
+  "model_family": "flexmore",
+  "model_variant": "danish",
+  "model_label": "flexdanish_2x7b_55b_v2_bf16",
+  "model": {
+    "model_name": "Flex-danish-2x7B-55B-v2-bf16",
+    "flexmore_checkpoint": "Flex-danish-2x7B-55B-v2-bf16",
+    "dtype": "bfloat16",
+    "trust_remote_code": true,
+    "low_cpu_mem_usage": true
+  },
+  "prompt_path": "data/eval/mkqa_da_eval_5000.jsonl",
+  "dataset_name": "mkqa",
+  "language": "da",
+  "max_prompts": 3,
+  "last_n_positions": 2,
+  "top_k": 8,
+  "test_tuned_from_model": false
+}

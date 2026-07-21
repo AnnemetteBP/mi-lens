@@ -1,0 +1,20 @@
+{
+  "project_root": ".",
+  "model_family": "example",
+  "model_variant": "base",
+  "model_label": "replace_me",
+  "model": {
+    "model_name": "replace-with-a-model-id-or-local-model-config",
+    "dtype": "bfloat16",
+    "low_cpu_mem_usage": true
+  },
+  "examples_path": "data/eval/mkqa_da_eval_5000.jsonl",
+  "dataset_name": "mkqa",
+  "dataset_split_role": "eval",
+  "language": "da",
+  "layers": [0, 8, 16, 24],
+  "max_examples": 1000,
+  "max_seq_len": 256,
+  "shard_size_tokens": 8192,
+  "artifact_dtype": "bfloat16"
+}

@@ -1,0 +1,39 @@
+{
+  "default_model_root": "/work/training/FlexMoRE/models",
+  "override_environment": "MI_LENS_FLEXMORE_MODEL_ROOT",
+  "analysis_matrix": {
+    "flexolmo_matched": [
+      "FlexOlmo-8x7B-1T-a2-55B-v2",
+      "FlexOlmo-8x7B-1T-a4-55B-v2",
+      "FlexOlmo-8x7B-1T-a7-55B-v2",
+      "FlexOlmo-8x7B-1T-a8-55B-v2"
+    ],
+    "flexolmo_rt": [
+      "FlexOlmo-8x7B-1T-a4-55B-v2-rt",
+      "FlexOlmo-8x7B-1T-a8-55B-v2-rt"
+    ],
+    "flexdanish_ablated_baselines": [
+      "Flex-danish-7x7B-a2-55B-v2",
+      "Flex-danish-7x7B-a4-55B-v2",
+      "Flex-danish-7x7B-a7-55B-v2"
+    ]
+  },
+  "flexdanish_checkpoints": {
+    "flexdanish_7x7b_a2_55b_v2": "Flex-danish-7x7B-a2-55B-v2",
+    "flexdanish_7x7b_a4_55b_v2": "Flex-danish-7x7B-a4-55B-v2",
+    "flexdanish_7x7b_a7_55b_v2": "Flex-danish-7x7B-a7-55B-v2",
+    "flexdanish_2x7b_5b": "Flex-danish-2x7B-5B",
+    "flexdanish_2x7b_5b_v2": "Flex-danish-2x7B-5B-v2",
+    "flexdanish_2x7b_10b_v2": "Flex-danish-2x7B-10B-v2",
+    "flexdanish_2x7b_15b_v2": "Flex-danish-2x7B-15B-v2",
+    "flexdanish_2x7b_20b_v2": "Flex-danish-2x7B-20B-v2",
+    "flexdanish_2x7b_25b_v2": "Flex-danish-2x7B-25B-v2",
+    "flexdanish_2x7b_30b_v2": "Flex-danish-2x7B-30B-v2",
+    "flexdanish_2x7b_35b_v2": "Flex-danish-2x7B-35B-v2",
+    "flexdanish_2x7b_40b_v2": "Flex-danish-2x7B-40B-v2",
+    "flexdanish_2x7b_45b_v2": "Flex-danish-2x7B-45B-v2",
+    "flexdanish_2x7b_50b_v2": "Flex-danish-2x7B-50B-v2",
+    "flexdanish_2x7b_55b_v2": "Flex-danish-2x7B-55B-v2",
+    "flexdanish_2x7b_55b_v2_bf16": "Flex-danish-2x7B-55B-v2-bf16"
+  }
+}

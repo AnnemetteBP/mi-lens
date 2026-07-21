@@ -1,0 +1,31 @@
+{
+  "project_root": ".",
+  "model_family": "mistral",
+  "model_variant": "base",
+  "model_label": "ministral_3_8b_base",
+  "model": {
+    "model_name": "mistralai/Ministral-3-8B-Base-2512",
+    "dtype": "bfloat16",
+    "trust_remote_code": false,
+    "low_cpu_mem_usage": true
+  },
+  "dataset_name": "mkqa",
+  "dataset_split_role": "trainfit",
+  "language": "en",
+  "examples_path": "data/train_fit/mkqa_en_trainfit_5000.jsonl",
+  "max_seq_len": 128,
+  "precision": "bfloat16",
+  "tokens_per_step": 128,
+  "num_steps": 500,
+  "per_gpu_batch_size": 1,
+  "loss": "KL",
+  "token_shift": 0,
+  "checkpoint_freq": 25,
+  "weight_decay": 0.001,
+  "lr_scale": 1.0,
+  "momentum": 0.9,
+  "optimizer": "sgd",
+  "warmup_steps": 0,
+  "output_path": "outputs/mistral/tuned_lens/ministral_3_8b_base_en_trainfit",
+  "checkpoint_dir": "outputs/mistral/tuned_lens/ministral_3_8b_base_en_trainfit_checkpoints"
+}

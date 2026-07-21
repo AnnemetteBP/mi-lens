@@ -1,0 +1,24 @@
+{
+  "project_root": ".",
+  "train_artifacts_path": "tmp/routerinterp/flexolmo/a4-55b-v2/train",
+  "eval_artifacts_path": "tmp/routerinterp/flexolmo/a4-55b-v2/eval",
+  "output_path": "tmp/routerinterp/flexolmo/a4-55b-v2/analysis_pilot",
+  "layers": [0],
+  "device": "cpu",
+  "max_train_tokens": 20000,
+  "max_eval_tokens": 5000,
+  "top_rho_features": 20,
+  "sae": {
+    "n_features": 16384,
+    "k": 64,
+    "pca_components": 1024,
+    "steps": 2000,
+    "batch_size": 128,
+    "learning_rate": 0.0003
+  },
+  "probe": {
+    "steps": 500,
+    "learning_rate": 0.001
+  },
+  "seed": 0
+}

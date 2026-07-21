@@ -1,0 +1,1 @@
+"""Fragmentation-visualization helpers placeholder."""

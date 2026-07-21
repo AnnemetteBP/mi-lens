@@ -11,15 +11,15 @@ requires-python = ">=3.10"
 authors = [{ name = "mi-lens contributors" }]
 dependencies = [
     "accelerate>=0.27.0",
-    "datasets>=2.17.1",
+    "datasets>=2.17.1,<4",
     "flatten-dict>=0.4.1",
     "huggingface_hub>=0.16.4",
     "ipywidgets",
     "numpy",
     "plotly>=5.13.1",
     "simple-parsing>=0.1.4",
-    "torch>=2.0,!=2.3.0",
-    "torchdata>=0.6.0",
+    "torch>=2.2",
+    "torchdata>=0.6.0,<0.8",
     "transformers>=4.38.1",
     "wandb>=0.15.0",
     "notebook",
@@ -52,7 +52,11 @@ include-package-data = true
 
 [tool.setuptools.packages.find]
 where = ["src", "lenses/jacobian_lens", "lenses/tuned_logit_lens"]
-include = ["methods*", "plotting*", "jlens*", "tuned_lens*"]
+include = [
+    "mi_lens*",
+    "jlens*",
+    "tuned_lens*",
+]
 namespaces = false
 
 [tool.setuptools.package-data]

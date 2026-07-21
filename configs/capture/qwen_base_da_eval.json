@@ -1,0 +1,28 @@
+{
+  "project_root": ".",
+  "model_family": "qwen",
+  "model_variant": "base",
+  "model_label": "qwen3_5_9b_base",
+  "model": {
+    "model_name": "Qwen/Qwen3.5-9B-Base",
+    "dtype": "bfloat16",
+    "trust_remote_code": false,
+    "low_cpu_mem_usage": true
+  },
+  "dataset_name": "mkqa",
+  "dataset_split_role": "eval",
+  "language": "da",
+  "examples_path": "data/eval/mkqa_da_eval_5000.jsonl",
+  "max_examples": 5000,
+  "max_seq_len": 128,
+  "last_n_positions": 12,
+  "top_k": 8,
+  "surface_top_k": 8,
+  "layer_stride": 1,
+  "include_topk_tokens": true,
+  "include_surface_metrics": true,
+  "save_prompt_artifacts": true,
+  "artifact_dtype": "float32",
+  "tuned_lens_path": "outputs/qwen/tuned_lens/qwen3_5_9b_base_da_trainfit",
+  "jlens_lens_path": "outputs/qwen/jlens/qwen3_5_9b_base_da_trainfit_lens.pt"
+}
