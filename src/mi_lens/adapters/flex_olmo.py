@@ -28,9 +28,8 @@ class FlexOlmoAdapter(BaseAdapter):
     """
     Capture router outputs from local FlexOlmo/FlexMoRE-style models.
 
-    The current local router implementation returns normalized routing probabilities
-    as its first output. We log-transform them so the rest of the toolkit can treat
-    them like router logits and recover the original probabilities via softmax.
+    Flex checkpoints expose either normalized routing probabilities or raw router
+    logits as their first gate output. The shared converter handles both forms.
     """
 
     def _collect_router_probs(self, model, inputs):
@@ -62,13 +61,17 @@ class FlexOlmoAdapter(BaseAdapter):
         )
 
     def get_router_logits(self, model, inputs):
-        router_probs = self._collect_router_probs(model, inputs)
+        router_outputs = self._collect_router_probs(model, inputs)
+        router_probs = router_scores_to_probabilities(
+            router_outputs,
+            scores_are_probabilities=None,
+        )
         return tuple(torch.log(layer_probs.clamp_min(1e-9)) for layer_probs in router_probs)
 
     def get_router_probs(self, model, inputs):
         return router_scores_to_probabilities(
             self._collect_router_probs(model, inputs),
-            scores_are_probabilities=True,
+            scores_are_probabilities=None,
         )
 
     def router_logits_to_probs(self, router_logits):

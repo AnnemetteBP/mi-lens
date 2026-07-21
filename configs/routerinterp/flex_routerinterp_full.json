@@ -28,14 +28,14 @@
     "seed": 0
   },
   "models": [
-    {"label": "flexolmo_7x7b_a2", "checkpoint": "FlexOlmo-7x7B-1T-a2"},
-    {"label": "flexolmo_7x7b_a4", "checkpoint": "FlexOlmo-7x7B-1T-a4"},
-    {"label": "flexolmo_7x7b_a7", "checkpoint": "FlexOlmo-7x7B-1T-a7"},
-    {"label": "flexdanish_8x7b_a2_55b_v2", "checkpoint": "FlexOlmo-8x7B-1T-a2-55B-v2"},
-    {"label": "flexdanish_8x7b_a4_55b_v2", "checkpoint": "FlexOlmo-8x7B-1T-a4-55B-v2"},
-    {"label": "flexdanish_8x7b_a7_55b_v2", "checkpoint": "FlexOlmo-8x7B-1T-a7-55B-v2"},
-    {"label": "flexdanish_8x7b_a8_55b_v2", "checkpoint": "FlexOlmo-8x7B-1T-a8-55B-v2"},
-    {"label": "flexdanish_8x7b_a4_55b_v2_rt", "checkpoint": "FlexOlmo-8x7B-1T-a4-55B-v2-rt"},
-    {"label": "flexdanish_8x7b_a8_55b_v2_rt", "checkpoint": "FlexOlmo-8x7B-1T-a8-55B-v2-rt"}
+    {"label": "flexolmo_7x7b_a2", "checkpoint": "FlexOlmo-7x7B-1T-a2", "expert_labels": ["public", "code", "creative", "math", "news", "academic", "reddit"]},
+    {"label": "flexolmo_7x7b_a4", "checkpoint": "FlexOlmo-7x7B-1T-a4", "expert_labels": ["public", "code", "creative", "math", "news", "academic", "reddit"]},
+    {"label": "flexolmo_7x7b_a7", "checkpoint": "FlexOlmo-7x7B-1T-a7", "expert_labels": ["public", "code", "creative", "math", "news", "academic", "reddit"]},
+    {"label": "flexdanish_8x7b_a2_55b_v2", "checkpoint": "FlexOlmo-8x7B-1T-a2-55B-v2", "expert_labels": ["public", "code", "creative", "math", "news", "academic", "reddit", "danish"]},
+    {"label": "flexdanish_8x7b_a4_55b_v2", "checkpoint": "FlexOlmo-8x7B-1T-a4-55B-v2", "expert_labels": ["public", "code", "creative", "math", "news", "academic", "reddit", "danish"]},
+    {"label": "flexdanish_8x7b_a7_55b_v2", "checkpoint": "FlexOlmo-8x7B-1T-a7-55B-v2", "expert_labels": ["public", "code", "creative", "math", "news", "academic", "reddit", "danish"]},
+    {"label": "flexdanish_8x7b_a8_55b_v2", "checkpoint": "FlexOlmo-8x7B-1T-a8-55B-v2", "expert_labels": ["public", "code", "creative", "math", "news", "academic", "reddit", "danish"]},
+    {"label": "flexdanish_8x7b_a4_55b_v2_rt", "checkpoint": "FlexOlmo-8x7B-1T-a4-55B-v2-rt", "expert_labels": ["public", "code", "creative", "math", "news", "academic", "reddit", "danish"]},
+    {"label": "flexdanish_8x7b_a8_55b_v2_rt", "checkpoint": "FlexOlmo-8x7B-1T-a8-55B-v2-rt", "expert_labels": ["public", "code", "creative", "math", "news", "academic", "reddit", "danish"]}
   ]
 }

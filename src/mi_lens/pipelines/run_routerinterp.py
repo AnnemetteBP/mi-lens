@@ -92,6 +92,7 @@ def run_routerinterp_capture_pipeline(config: dict[str, Any]) -> dict[str, Any]:
             layers = tuple(int(layer) for layer in requested_layers)
         capture_config = RouterInterpCaptureConfig(
             layers=layers,
+            expert_labels=tuple(str(label) for label in config.get("expert_labels", ())),
             max_seq_len=None if config.get("max_seq_len") is None else int(config["max_seq_len"]),
             skip_first_token=bool(config.get("skip_first_token", True)),
             artifact_dtype=str(config.get("artifact_dtype", "bfloat16")),
@@ -355,7 +356,12 @@ def run_routerinterp_analysis_pipeline(config: dict[str, Any]) -> dict[str, Any]
     probe_settings = dict(config.get("probe", {}))
     top_rho_count = int(config.get("top_rho_features", 20))
     seed = int(config.get("seed", 0))
-    results: dict[str, Any] = {"format": "mi_lens.routerinterp.analysis.v1", "layers": {}}
+    expert_labels = [str(label) for label in config.get("expert_labels", ())]
+    results: dict[str, Any] = {
+        "format": "mi_lens.routerinterp.analysis.v1",
+        "expert_labels": expert_labels,
+        "layers": {},
+    }
 
     for layer in layers:
         (
@@ -391,6 +397,11 @@ def run_routerinterp_analysis_pipeline(config: dict[str, Any]) -> dict[str, Any]
         n_experts = train_num_experts
         if n_experts < 2:
             raise ValueError(f"Layer {layer} has fewer than two observed experts.")
+        if expert_labels and len(expert_labels) != n_experts:
+            raise ValueError(
+                "Configured expert labels do not match the captured router width: "
+                f"received {len(expert_labels)} labels for {n_experts} experts."
+            )
 
         protocol = _resolve_routerinterp_protocol(config, d_model=int(train_x.shape[1]))
         sae_fit_tokens = protocol["sae_fit_tokens"]
@@ -548,6 +559,7 @@ def run_routerinterp_analysis_pipeline(config: dict[str, Any]) -> dict[str, Any]
                 "probe_state_dict": primary_sae_probe.state_dict(),
                 "n_features": sae_config.n_features,
                 "n_experts": n_experts,
+                "expert_labels": expert_labels,
                 "rho": rho.cpu(),
                 "top_rho_indices": rho_indices.cpu(),
                 "top_rho_values": rho_values.cpu(),
@@ -567,6 +579,7 @@ def run_routerinterp_analysis_pipeline(config: dict[str, Any]) -> dict[str, Any]
             "routing_probe_fit_tokens": probe_fit_tokens,
             "eval_tokens": eval_token_count,
             "num_experts": n_experts,
+            "expert_labels": expert_labels,
             "routing_top_k": train_top_k,
             "matched_basis_sparsity": sae_config.k,
             "pca_components": pca_components,
@@ -588,6 +601,8 @@ def run_routerinterp_analysis_pipeline(config: dict[str, Any]) -> dict[str, Any]
             "top_rho_features": [
                 {
                     "expert": expert,
+                    "expert_id": expert,
+                    "expert_label": expert_labels[expert] if expert_labels else f"expert_{expert}",
                     "feature_ids": rho_indices[expert].cpu().tolist(),
                     "rho": rho_values[expert].cpu().tolist(),
                 }

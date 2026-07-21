@@ -11,7 +11,10 @@ import torch
 from torch import nn
 
 from mi_lens.adapters.flex_olmo import iter_flex_olmo_layers
-from mi_lens.adapters.router_outputs import input_batch_and_sequence_length
+from mi_lens.adapters.router_outputs import (
+    input_batch_and_sequence_length,
+    router_scores_to_probabilities,
+)
 
 
 @dataclass(slots=True)
@@ -24,6 +27,7 @@ class RouterLayerCapture:
 @dataclass(slots=True)
 class RouterInterpCaptureConfig:
     layers: tuple[int, ...]
+    expert_labels: tuple[str, ...] = ()
     max_seq_len: int | None = None
     skip_first_token: bool = True
     artifact_dtype: str = "bfloat16"
@@ -73,18 +77,15 @@ def capture_flexolmo_router_layers(
 
     captures = []
     for router_input, output in zip(raw_inputs, raw_outputs):
-        probabilities = output[0] if isinstance(output, tuple) else output
-        if not isinstance(probabilities, torch.Tensor):
-            raise TypeError("FlexOlmo router did not return a probability tensor.")
-        probabilities = _as_batch_sequence(probabilities, batch_size, sequence_length).float()
+        router_scores = output[0] if isinstance(output, tuple) else output
+        if not isinstance(router_scores, torch.Tensor):
+            raise TypeError("FlexOlmo router did not return a tensor as its first gate output.")
+        router_scores = _as_batch_sequence(router_scores, batch_size, sequence_length)
+        probabilities = router_scores_to_probabilities(
+            (router_scores,),
+            scores_are_probabilities=None,
+        )[0]
         router_input = _as_batch_sequence(router_input, batch_size, sequence_length).float()
-        if not torch.allclose(
-            probabilities.sum(dim=-1),
-            torch.ones_like(probabilities[..., 0]),
-            rtol=1e-4,
-            atol=2e-3,
-        ):
-            raise ValueError("Expected normalized FlexOlmo router probabilities.")
         effective_top_k = top_k or int(getattr(model.config, "num_experts_per_tok", 1))
         captures.append(
             RouterLayerCapture(
@@ -149,6 +150,12 @@ def capture_routerinterp_prompt_artifacts(
         artifact_layers = {}
         for layer in selected_layers:
             capture = captures[layer]
+            router_width = int(capture.router_probabilities.shape[-1])
+            if config.expert_labels and len(config.expert_labels) != router_width:
+                raise ValueError(
+                    "Configured expert labels do not match the router width: "
+                    f"received {len(config.expert_labels)} labels for {router_width} experts."
+                )
             artifact_layers[str(layer)] = {
                 "router_input": capture.router_input[0, positions].cpu().to(artifact_dtype),
                 "router_probabilities": capture.router_probabilities[0, positions].cpu().to(artifact_dtype),

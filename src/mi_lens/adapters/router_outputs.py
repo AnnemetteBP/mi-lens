@@ -84,16 +84,33 @@ def normalize_router_layers(
 def router_scores_to_probabilities(
     router_scores: Sequence[torch.Tensor],
     *,
-    scores_are_probabilities: bool = False,
+    scores_are_probabilities: bool | None = False,
 ) -> tuple[torch.Tensor, ...]:
-    """Convert normalized router scores to validated probability distributions."""
+    """Convert router outputs to validated probability distributions.
+
+    ``None`` accepts either router convention used by supported Flex checkpoints:
+    normalized non-negative probabilities or unnormalized router logits.
+    """
 
     probabilities = []
     for layer_scores in router_scores:
-        if scores_are_probabilities:
-            layer_probs = layer_scores.float()
+        scores = layer_scores.float()
+        normalized = (
+            torch.isfinite(scores).all()
+            and not (scores < 0).any()
+            and torch.allclose(
+                scores.sum(dim=-1),
+                torch.ones_like(scores[..., 0]),
+                rtol=1e-4,
+                atol=2e-3,
+            )
+        )
+        if scores_are_probabilities is True:
+            layer_probs = scores
+        elif scores_are_probabilities is None and normalized:
+            layer_probs = scores
         else:
-            layer_probs = torch.softmax(layer_scores.float(), dim=-1)
+            layer_probs = torch.softmax(scores, dim=-1)
 
         if not torch.isfinite(layer_probs).all():
             raise ValueError("Router probabilities contain non-finite values.")

@@ -48,6 +48,7 @@ def main() -> None:
     for model in models:
         label = str(model["label"])
         checkpoint = str(model["checkpoint"])
+        expert_labels = [str(label) for label in model.get("expert_labels", ())]
         model_config = {
             "model_name": checkpoint,
             "flexmore_checkpoint": checkpoint,
@@ -65,6 +66,7 @@ def main() -> None:
             "examples_glob": source["sae_fit_glob"],
             "output_path": f"{base_output}/sae_fit",
             "dataset_split_role": "sae_fit",
+            "expert_labels": expert_labels,
             **capture,
         }
         eval_config = {
@@ -75,6 +77,7 @@ def main() -> None:
             "examples_glob": source["eval_glob"],
             "output_path": f"{base_output}/eval",
             "dataset_split_role": "eval",
+            "expert_labels": expert_labels,
             **capture,
         }
         analysis_config = {
@@ -83,6 +86,7 @@ def main() -> None:
             "eval_artifacts_path": f"{base_output}/eval",
             "output_path": f"{base_output}/analysis",
             "layers": "captured",
+            "expert_labels": expert_labels,
             **analysis,
         }
         train_path = generated_dir / label / "capture_sae_fit.json"
