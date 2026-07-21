@@ -1,0 +1,41 @@
+{
+  "project_root": ".",
+  "batch_name": "flex_routerinterp_paper_protocol",
+  "continue_on_error": true,
+  "source": {
+    "sae_fit_glob": "data/router/sae_fit/*.jsonl",
+    "eval_glob": "data/router/eval/*.jsonl"
+  },
+  "capture": {
+    "layers": "routerinterp_quartiles",
+    "max_examples": null,
+    "max_seq_len": null,
+    "skip_first_token": true,
+    "artifact_dtype": "bfloat16"
+  },
+  "analysis": {
+    "protocol": "routerinterp_olmoe_topk",
+    "device": "cuda",
+    "max_sae_fit_tokens": 100000000,
+    "max_probe_fit_tokens": 1000000,
+    "max_eval_tokens": null,
+    "strict_token_budgets": true,
+    "active_feature_counts": [1, 2, 4, 8, 16, 32],
+    "primary_active_features": 32,
+    "top_rho_features": 20,
+    "sae": {"k": 32},
+    "probe": {"steps": 500, "learning_rate": 0.001},
+    "seed": 0
+  },
+  "models": [
+    {"label": "flexolmo_7x7b_a2", "checkpoint": "FlexOlmo-7x7B-1T-a2"},
+    {"label": "flexolmo_7x7b_a4", "checkpoint": "FlexOlmo-7x7B-1T-a4"},
+    {"label": "flexolmo_7x7b_a7", "checkpoint": "FlexOlmo-7x7B-1T-a7"},
+    {"label": "flexdanish_8x7b_a2_55b_v2", "checkpoint": "FlexOlmo-8x7B-1T-a2-55B-v2"},
+    {"label": "flexdanish_8x7b_a4_55b_v2", "checkpoint": "FlexOlmo-8x7B-1T-a4-55B-v2"},
+    {"label": "flexdanish_8x7b_a7_55b_v2", "checkpoint": "FlexOlmo-8x7B-1T-a7-55B-v2"},
+    {"label": "flexdanish_8x7b_a8_55b_v2", "checkpoint": "FlexOlmo-8x7B-1T-a8-55B-v2"},
+    {"label": "flexdanish_8x7b_a4_55b_v2_rt", "checkpoint": "FlexOlmo-8x7B-1T-a4-55B-v2-rt"},
+    {"label": "flexdanish_8x7b_a8_55b_v2_rt", "checkpoint": "FlexOlmo-8x7B-1T-a8-55B-v2-rt"}
+  ]
+}

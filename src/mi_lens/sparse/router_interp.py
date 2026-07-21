@@ -24,7 +24,7 @@ class RouterLayerCapture:
 @dataclass(slots=True)
 class RouterInterpCaptureConfig:
     layers: tuple[int, ...]
-    max_seq_len: int = 512
+    max_seq_len: int | None = None
     skip_first_token: bool = True
     artifact_dtype: str = "bfloat16"
 
@@ -131,7 +131,10 @@ def capture_routerinterp_prompt_artifacts(
         prompt = example.get("prompt", example.get("text"))
         if prompt is None:
             raise KeyError("RouterInterp examples require `prompt` or `text`.")
-        encoded = tokenizer(str(prompt), return_tensors="pt", truncation=True, max_length=config.max_seq_len)
+        tokenizer_kwargs = {"return_tensors": "pt", "truncation": config.max_seq_len is not None}
+        if config.max_seq_len is not None:
+            tokenizer_kwargs["max_length"] = config.max_seq_len
+        encoded = tokenizer(str(prompt), **tokenizer_kwargs)
         input_ids = encoded.input_ids.to(device)
         token_count = int(input_ids.shape[1])
         start = 1 if config.skip_first_token else 0

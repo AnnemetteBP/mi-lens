@@ -24,6 +24,7 @@ from mi_lens.sparse import (
     top_k_expert_predictions,
     top_rho_features,
 )
+from mi_lens.adapters.flex_olmo import iter_flex_olmo_layers
 
 from .common import (
     ModelLoadConfig,
@@ -65,19 +66,36 @@ def run_routerinterp_capture_pipeline(config: dict[str, Any]) -> dict[str, Any]:
     project_root = Path(config["project_root"]).resolve()
     model_config = ModelLoadConfig(**config["model"])
     output_dir = _routerinterp_output_dir(config)
-    records = load_jsonl_records(project_root / config["examples_path"])
+    if "examples_path" in config:
+        example_paths = [project_root / str(config["examples_path"])]
+    elif "examples_glob" in config:
+        example_paths = sorted(project_root.glob(str(config["examples_glob"])))
+        if not example_paths:
+            raise FileNotFoundError(f"No JSONL files matched {config['examples_glob']!r}.")
+    else:
+        raise KeyError("RouterInterp capture requires `examples_path` or `examples_glob`.")
+    records = []
+    for example_path in example_paths:
+        records.extend(load_jsonl_records(example_path))
     if config.get("max_examples") is not None:
         records = records[: int(config["max_examples"])]
-    capture_config = RouterInterpCaptureConfig(
-        layers=tuple(int(layer) for layer in config["layers"]),
-        max_seq_len=int(config.get("max_seq_len", 512)),
-        skip_first_token=bool(config.get("skip_first_token", True)),
-        artifact_dtype=str(config.get("artifact_dtype", "bfloat16")),
-    )
-
     model, tokenizer, cache_dir = load_model_and_tokenizer(model_config, project_root=project_root)
     model.eval()
     try:
+        requested_layers = config["layers"]
+        if requested_layers == "routerinterp_quartiles":
+            layer_count = len(iter_flex_olmo_layers(model))
+            if layer_count < 4:
+                raise ValueError("RouterInterp quartile selection requires at least four layers.")
+            layers = tuple((index + 1) * layer_count // 4 - 1 for index in range(4))
+        else:
+            layers = tuple(int(layer) for layer in requested_layers)
+        capture_config = RouterInterpCaptureConfig(
+            layers=layers,
+            max_seq_len=None if config.get("max_seq_len") is None else int(config["max_seq_len"]),
+            skip_first_token=bool(config.get("skip_first_token", True)),
+            artifact_dtype=str(config.get("artifact_dtype", "bfloat16")),
+        )
         manifest = capture_routerinterp_prompt_artifacts(
             model,
             tokenizer,
@@ -97,7 +115,7 @@ def run_routerinterp_capture_pipeline(config: dict[str, Any]) -> dict[str, Any]:
                 cache_dir=cache_dir,
                 extra={
                     "output_dir": str(output_dir),
-                    "examples_path": str(config["examples_path"]),
+                    "examples_paths": [str(path) for path in example_paths],
                     "dataset_split_role": config.get("dataset_split_role", "train"),
                     "layers": list(capture_config.layers),
                 },
@@ -328,7 +346,11 @@ def run_routerinterp_analysis_pipeline(config: dict[str, Any]) -> dict[str, Any]
     device = torch.device(str(config.get("device", "cpu")))
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("RouterInterp analysis requested CUDA, but CUDA is unavailable.")
-    layers = tuple(int(layer) for layer in config["layers"])
+    requested_layers = config["layers"]
+    if requested_layers == "captured":
+        manifest = json.loads((train_dir / "manifest.json").read_text(encoding="utf-8"))
+        requested_layers = manifest["config"]["layers"]
+    layers = tuple(int(layer) for layer in requested_layers)
     max_eval_tokens = config.get("max_eval_tokens")
     probe_settings = dict(config.get("probe", {}))
     top_rho_count = int(config.get("top_rho_features", 20))

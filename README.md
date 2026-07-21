@@ -121,7 +121,7 @@ write_dataset_registry(
 
 ```bash
 conda env create -f environment.yml
-conda activate mi-lens
+conda activate mi-lens-env
 scripts/install_environment.sh
 ```
 

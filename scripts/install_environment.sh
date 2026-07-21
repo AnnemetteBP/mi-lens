@@ -66,6 +66,8 @@ if [[ -n "$FLEX_TRANSFORMERS_DIR" ]]; then
     "$PYTHON" -m pip install -e "$FLEX_TRANSFORMERS_DIR"
 fi
 
+"$PYTHON" -m pip check
+
 "$PYTHON" - <<'PY'
 import datasets
 import torch

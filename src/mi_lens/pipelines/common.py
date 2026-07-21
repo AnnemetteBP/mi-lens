@@ -82,9 +82,23 @@ def configure_hf_cache(project_root: str | Path) -> Path:
     paths = pipeline_project_paths(project_root)
     cache_dir = paths.cache_dir
     cache_dir.mkdir(parents=True, exist_ok=True)
+    runtime_dir = paths.root / "tmp" / "runtime"
+    xdg_cache_dir = paths.root / "tmp" / "xdg_cache"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    xdg_cache_dir.mkdir(parents=True, exist_ok=True)
+
+    # Checkpoints can live on a read-only shared UCloud mount. Keep every cache,
+    # lock, and temporary file created by this process inside the project clone.
     os.environ["HF_HOME"] = str(cache_dir)
+    os.environ["HF_HUB_CACHE"] = str(cache_dir / "hub")
+    os.environ["HF_ASSETS_CACHE"] = str(cache_dir / "assets")
     os.environ["HUGGINGFACE_HUB_CACHE"] = str(cache_dir / "hub")
     os.environ["TRANSFORMERS_CACHE"] = str(cache_dir / "transformers")
+    os.environ["TORCH_HOME"] = str(cache_dir / "torch")
+    os.environ["XDG_CACHE_HOME"] = str(xdg_cache_dir)
+    os.environ["TMPDIR"] = str(runtime_dir)
+    os.environ["TMP"] = str(runtime_dir)
+    os.environ["TEMP"] = str(runtime_dir)
     return cache_dir
 
 
