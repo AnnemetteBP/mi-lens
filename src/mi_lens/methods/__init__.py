@@ -42,6 +42,13 @@ from .routing_eval import (
     summarize_router_score_coactivation,
     summarize_router_scores,
 )
+from .router_data_prep import (
+    RouterDataPaths,
+    RouterDatasetExportSpec,
+    export_router_dataset_to_jsonl,
+    prepare_router_datasets_from_config,
+    router_data_paths,
+)
 from .tokenization_audit import (
     TokenAuditConfig,
     TokenAuditRow,
@@ -87,4 +94,9 @@ __all__ = [
     "summarize_router_scores",
     "summarize_router_coactivation",
     "summarize_router_score_coactivation",
+    "RouterDataPaths",
+    "RouterDatasetExportSpec",
+    "export_router_dataset_to_jsonl",
+    "prepare_router_datasets_from_config",
+    "router_data_paths",
 ]

@@ -1,0 +1,24 @@
+{
+  "project_root": ".",
+  "protocol": "routerinterp_olmoe_topk",
+  "train_artifacts_path": "tmp/routerinterp/REPLACE_MODEL/sae_fit",
+  "eval_artifacts_path": "tmp/routerinterp/REPLACE_MODEL/eval",
+  "output_path": "tmp/routerinterp/REPLACE_MODEL/analysis_routerinterp_olmoe",
+  "layers": [3, 7, 11, 15],
+  "device": "cuda",
+  "max_sae_fit_tokens": 100000000,
+  "max_probe_fit_tokens": 1000000,
+  "max_eval_tokens": null,
+  "strict_token_budgets": true,
+  "active_feature_counts": [1, 2, 4, 8, 16, 32],
+  "primary_active_features": 32,
+  "top_rho_features": 20,
+  "sae": {
+    "k": 32
+  },
+  "probe": {
+    "steps": 500,
+    "learning_rate": 0.001
+  },
+  "seed": 0
+}

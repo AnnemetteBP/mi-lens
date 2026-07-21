@@ -1,0 +1,215 @@
+{
+  "description": "Fixed source-order pilot exports for RouterInterp-style SAE fitting and router evaluation. No exporter shuffles rows.",
+  "sae_fit": [
+    {
+      "name": "gsm8k_en_train",
+      "dataset_name": "openai/gsm8k",
+      "config_name": "main",
+      "split": "train",
+      "domain": "math",
+      "language": "en",
+      "adapter": "gsm8k",
+      "max_records": 100,
+      "native_id_field": "id"
+    },
+    {
+      "name": "hellaswag_en_train",
+      "dataset_name": "allenai/hellaswag",
+      "split": "train",
+      "domain": "general",
+      "language": "en",
+      "adapter": "hellaswag",
+      "max_records": 100,
+      "native_id_field": "ind"
+    },
+    {
+      "name": "social_iqa_en_train",
+      "dataset_name": "allenai/social_i_qa",
+      "split": "train",
+      "domain": "social",
+      "language": "en",
+      "adapter": "social_iqa",
+      "max_records": 100
+    },
+    {
+      "name": "mbpp_en_train",
+      "dataset_name": "google-research-datasets/mbpp",
+      "config_name": "full",
+      "split": "train",
+      "domain": "code",
+      "language": "en",
+      "adapter": "mbpp",
+      "max_records": 100,
+      "native_id_field": "task_id"
+    },
+    {
+      "name": "muse_news_en_retain1",
+      "dataset_name": "muse-bench/MUSE-News",
+      "config_name": "train",
+      "split": "retain1",
+      "domain": "news",
+      "language": "en",
+      "adapter": "muse_news",
+      "max_records": 100,
+      "native_id_field": "id"
+    },
+    {
+      "name": "nordjylland_news_da_train",
+      "dataset_name": "alexandrainst/nordjylland-news-summarization",
+      "split": "train",
+      "revision": "a7b9fe912984f4f6e2b74a5387f3e9afc097500d",
+      "data_file": "hf://datasets/alexandrainst/nordjylland-news-summarization@a7b9fe912984f4f6e2b74a5387f3e9afc097500d/data/train-00000-of-00001-4fb110c0f6314175.parquet",
+      "domain": "news",
+      "language": "da",
+      "adapter": "text",
+      "text_field": "text",
+      "target_field": "summary",
+      "label_field": null,
+      "max_records": 100
+    }
+  ],
+  "eval": [
+    {
+      "name": "gsm8k_en_test",
+      "dataset_name": "openai/gsm8k",
+      "config_name": "main",
+      "split": "test",
+      "domain": "math",
+      "language": "en",
+      "adapter": "gsm8k",
+      "max_records": 100,
+      "native_id_field": "id"
+    },
+    {
+      "name": "hellaswag_en_validation",
+      "dataset_name": "allenai/hellaswag",
+      "split": "validation",
+      "domain": "general",
+      "language": "en",
+      "adapter": "hellaswag",
+      "max_records": 100,
+      "native_id_field": "ind"
+    },
+    {
+      "name": "social_iqa_en_validation",
+      "dataset_name": "allenai/social_i_qa",
+      "split": "validation",
+      "domain": "social",
+      "language": "en",
+      "adapter": "social_iqa",
+      "max_records": 100
+    },
+    {
+      "name": "mbpp_en_test",
+      "dataset_name": "google-research-datasets/mbpp",
+      "config_name": "full",
+      "split": "test",
+      "domain": "code",
+      "language": "en",
+      "adapter": "mbpp",
+      "max_records": 100,
+      "native_id_field": "task_id"
+    },
+    {
+      "name": "mmlu_pro_biology_en_test",
+      "dataset_name": "TIGER-Lab/MMLU-Pro",
+      "split": "test",
+      "domain": "academic_science",
+      "language": "en",
+      "adapter": "mmlu_pro",
+      "filter_field": "category",
+      "filter_value": "biology",
+      "max_records": 100,
+      "native_id_field": "question_id"
+    },
+    {
+      "name": "muse_news_en_validation",
+      "dataset_name": "muse-bench/MUSE-News",
+      "config_name": "train",
+      "split": "retain2",
+      "domain": "news",
+      "language": "en",
+      "adapter": "muse_news",
+      "max_records": 100,
+      "native_id_field": "id"
+    },
+    {
+      "name": "poetry_en_train_slice",
+      "dataset_name": "merve/poetry",
+      "split": "train",
+      "start_idx": 100,
+      "domain": "creative",
+      "language": "en",
+      "adapter": "poetry",
+      "max_records": 100,
+      "native_id_field": "id"
+    },
+    {
+      "name": "hellaswag_da",
+      "dataset_name": "EuroEval/hellaswag-da-mini",
+      "split": "test",
+      "domain": "general",
+      "language": "da",
+      "adapter": "template",
+      "prompt_template": "Spørgsmål: {text}\nSvar:",
+      "label_field": "label",
+      "max_records": 100
+    },
+    {
+      "name": "angry_tweets_da",
+      "dataset_name": "EuroEval/angry-tweets-mini",
+      "split": "test",
+      "domain": "social",
+      "language": "da",
+      "adapter": "template",
+      "prompt_template": "Dokument: {text}\nSentiment:",
+      "label_field": "label",
+      "max_records": 100
+    },
+    {
+      "name": "multi_wiki_qa_da",
+      "dataset_name": "EuroEval/multi-wiki-qa-da-mini",
+      "split": "test",
+      "domain": "knowledge",
+      "language": "da",
+      "adapter": "template",
+      "prompt_template": "Tekst: {text}\nSpørgsmål: {question}\nSvar med maks. 3 ord:",
+      "target_field": "target_text",
+      "label_field": null,
+      "max_records": 100
+    },
+    {
+      "name": "nordjylland_news_da_test",
+      "dataset_name": "alexandrainst/nordjylland-news-summarization",
+      "split": "test",
+      "revision": "a7b9fe912984f4f6e2b74a5387f3e9afc097500d",
+      "data_file": "hf://datasets/alexandrainst/nordjylland-news-summarization@a7b9fe912984f4f6e2b74a5387f3e9afc097500d/data/test-00000-of-00001-fe5a9a4940bb3673.parquet",
+      "domain": "news",
+      "language": "da",
+      "adapter": "text",
+      "text_field": "text",
+      "target_field": "summary",
+      "label_field": null,
+      "prompt_prefix": "Dokument: ",
+      "prompt_suffix": "\nResumé:",
+      "max_records": 100
+    },
+    {
+      "name": "valeu_da",
+      "dataset_name": "EuroEval/european-values-da",
+      "split": "test",
+      "domain": "values",
+      "language": "da",
+      "adapter": "template",
+      "prompt_template": "Spørgsmål: {text}\nSvar:",
+      "label_field": "label",
+      "max_records": 100
+    }
+  ],
+  "deferred": [
+    {
+      "name": "agieval_lsat_lr",
+      "reason": "AGIEval LSAT-LR is distributed by the official AGIEval/OLMES repository as JSONL rather than by the selected Hugging Face sources. Add it only after pinning that source as a project dependency, so its version and prompt formatter are recorded."
+    }
+  ]
+}

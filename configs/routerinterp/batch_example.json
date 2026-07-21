@@ -1,0 +1,13 @@
+{
+  "project_root": ".",
+  "batch_name": "flex_routerinterp_pilot",
+  "continue_on_error": false,
+  "jobs": [
+    {
+      "name": "replace_with_verified_model_label",
+      "capture_train_config": "configs/routerinterp/replace_train.json",
+      "capture_eval_config": "configs/routerinterp/replace_eval.json",
+      "analysis_config": "configs/routerinterp/replace_analysis.json"
+    }
+  ]
+}

@@ -185,6 +185,16 @@ def _constant_top_k(selected_experts: torch.Tensor, split_name: str) -> int:
     return int(selected_experts.shape[1])
 
 
+def _captured_token_count(artifact_dir: Path) -> int:
+    """Read the manifest count before materialising any high-dimensional vectors."""
+
+    manifest = json.loads((artifact_dir / "manifest.json").read_text(encoding="utf-8"))
+    try:
+        return sum(int(row["num_tokens"]) for row in manifest["prompts"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"Malformed RouterInterp manifest at {artifact_dir / 'manifest.json'}.") from exc
+
+
 def _fit_ngram_counts(keys: torch.Tensor, targets: torch.Tensor) -> tuple[dict[tuple[int, ...], torch.Tensor], torch.Tensor]:
     """Count train-only token or token-pair co-occurrence with routed experts."""
 
@@ -218,6 +228,74 @@ def _probe_metrics(probe, features: torch.Tensor, targets: torch.Tensor, *, top_
     }
 
 
+def _resolve_routerinterp_protocol(config: dict[str, Any], d_model: int) -> dict[str, Any]:
+    """Resolve the paper's OLMoE Top-K SAE protocol without hiding deviations.
+
+    The RouterInterp paper specifies the SAE width/sparsity and the token budgets,
+    but not optimiser or batch-size hyperparameters. Those remain explicit config
+    values and are recorded as implementation choices.
+    """
+
+    protocol = str(config.get("protocol", "custom"))
+    sae_settings = dict(config.get("sae", {}))
+    if protocol != "routerinterp_olmoe_topk":
+        return {
+            "name": protocol,
+            "sae_fit_tokens": config.get("max_sae_fit_tokens", config.get("max_train_tokens")),
+            "probe_fit_tokens": config.get("max_probe_fit_tokens", config.get("max_train_tokens")),
+            "active_feature_counts": config.get("active_feature_counts", [int(sae_settings.get("k", 64))]),
+            "primary_active_features": config.get("primary_active_features"),
+            "sae": sae_settings,
+            "strict_token_budgets": False,
+        }
+
+    # RouterInterp's OLMoE protocol: 16x expansion, Top-K k=32, 100M
+    # SAE-fitting tokens, and 1M tokens for the routing-prediction probes.
+    expected_features = 16 * d_model
+    required = {
+        "k": 32,
+        "n_features": expected_features,
+    }
+    for key, expected in required.items():
+        actual = sae_settings.get(key, expected)
+        if int(actual) != expected:
+            raise ValueError(
+                f"RouterInterp OLMoE protocol requires sae.{key}={expected}; got {actual}. "
+                "Use protocol='custom' for an intentional deviation."
+            )
+        sae_settings[key] = expected
+
+    expected_counts = [1, 2, 4, 8, 16, 32]
+    actual_counts = [int(value) for value in config.get("active_feature_counts", expected_counts)]
+    if actual_counts != expected_counts:
+        raise ValueError(
+            "RouterInterp OLMoE protocol requires active_feature_counts="
+            f"{expected_counts}; got {actual_counts}."
+        )
+    primary_active_features = int(config.get("primary_active_features", 32))
+    if primary_active_features != 32:
+        raise ValueError(
+            "RouterInterp OLMoE protocol uses primary_active_features=32. "
+            "Use protocol='custom' for an intentional deviation."
+        )
+    sae_fit_tokens = int(config.get("max_sae_fit_tokens", 100_000_000))
+    probe_fit_tokens = int(config.get("max_probe_fit_tokens", 1_000_000))
+    if sae_fit_tokens != 100_000_000 or probe_fit_tokens != 1_000_000:
+        raise ValueError(
+            "RouterInterp OLMoE protocol requires max_sae_fit_tokens=100000000 "
+            "and max_probe_fit_tokens=1000000. Use protocol='custom' for an intentional deviation."
+        )
+    return {
+        "name": protocol,
+        "sae_fit_tokens": sae_fit_tokens,
+        "probe_fit_tokens": probe_fit_tokens,
+        "active_feature_counts": expected_counts,
+        "primary_active_features": primary_active_features,
+        "sae": sae_settings,
+        "strict_token_budgets": bool(config.get("strict_token_budgets", True)),
+    }
+
+
 def run_routerinterp_analysis_pipeline(config: dict[str, Any]) -> dict[str, Any]:
     """Train per-layer Top-K SAEs and evaluate routing explanations held out.
 
@@ -231,6 +309,17 @@ def run_routerinterp_analysis_pipeline(config: dict[str, Any]) -> dict[str, Any]
     eval_dir = _project_tmp_path(project_root, str(config["eval_artifacts_path"]))
     if train_dir.resolve() == eval_dir.resolve():
         raise ValueError("RouterInterp train and evaluation artifact directories must differ.")
+    if str(config.get("protocol", "custom")) == "routerinterp_olmoe_topk" and bool(
+        config.get("strict_token_budgets", True)
+    ):
+        required_tokens = int(config.get("max_sae_fit_tokens", 100_000_000))
+        available_tokens = _captured_token_count(train_dir)
+        if available_tokens < required_tokens:
+            raise ValueError(
+                "RouterInterp OLMoE protocol requires 100,000,000 SAE-fitting tokens; "
+                f"the captured fitting artifacts contain {available_tokens:,}. "
+                "Use the custom pilot profile for a smaller study rather than labelling it paper-scale."
+            )
     output_dir = _project_tmp_path(
         project_root,
         str(config.get("output_path", "tmp/routerinterp/analysis")),
@@ -240,9 +329,7 @@ def run_routerinterp_analysis_pipeline(config: dict[str, Any]) -> dict[str, Any]
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("RouterInterp analysis requested CUDA, but CUDA is unavailable.")
     layers = tuple(int(layer) for layer in config["layers"])
-    max_train_tokens = config.get("max_train_tokens")
     max_eval_tokens = config.get("max_eval_tokens")
-    sae_settings = dict(config.get("sae", {}))
     probe_settings = dict(config.get("probe", {}))
     top_rho_count = int(config.get("top_rho_features", 20))
     seed = int(config.get("seed", 0))
@@ -257,7 +344,9 @@ def run_routerinterp_analysis_pipeline(config: dict[str, Any]) -> dict[str, Any]
             train_token_count,
             train_num_experts,
         ) = _load_layer_tokens(
-            train_dir, layer=layer, max_tokens=None if max_train_tokens is None else int(max_train_tokens)
+            train_dir,
+            layer=layer,
+            max_tokens=None,
         )
         (
             eval_x,
@@ -281,10 +370,43 @@ def run_routerinterp_analysis_pipeline(config: dict[str, Any]) -> dict[str, Any]
         if n_experts < 2:
             raise ValueError(f"Layer {layer} has fewer than two observed experts.")
 
+        protocol = _resolve_routerinterp_protocol(config, d_model=int(train_x.shape[1]))
+        sae_fit_tokens = protocol["sae_fit_tokens"]
+        probe_fit_tokens = protocol["probe_fit_tokens"]
+        if sae_fit_tokens is not None:
+            sae_fit_tokens = min(int(sae_fit_tokens), train_token_count)
+        else:
+            sae_fit_tokens = train_token_count
+        if probe_fit_tokens is not None:
+            probe_fit_tokens = min(int(probe_fit_tokens), sae_fit_tokens)
+        else:
+            probe_fit_tokens = sae_fit_tokens
+        if protocol["strict_token_budgets"] and (
+            sae_fit_tokens != int(protocol["sae_fit_tokens"])
+            or probe_fit_tokens != int(protocol["probe_fit_tokens"])
+        ):
+            raise ValueError(
+                "Captured fitting artifacts do not meet the RouterInterp paper token budgets: "
+                f"need {protocol['sae_fit_tokens']:,} SAE-fitting tokens and "
+                f"{protocol['probe_fit_tokens']:,} routing-probe tokens; found {train_token_count:,}."
+            )
+        train_x = train_x[:sae_fit_tokens]
+        train_selected = train_selected[:sae_fit_tokens]
+        train_token_ids = train_token_ids[:sae_fit_tokens]
+        train_previous_token_ids = train_previous_token_ids[:sae_fit_tokens]
+        train_token_count = sae_fit_tokens
+
         train_x = train_x.to(device)
         eval_x = eval_x.to(device)
         train_targets = selected_expert_targets(train_selected.to(device), n_experts)
         eval_targets = selected_expert_targets(eval_selected.to(device), n_experts)
+        sae_settings = protocol["sae"]
+        sae_training_settings = {
+            "steps": int(sae_settings.get("steps", 10_000)),
+            "batch_size": int(sae_settings.get("batch_size", 1024)),
+            "learning_rate": float(sae_settings.get("learning_rate", 3e-4)),
+            "seed": seed + layer,
+        }
         sae_config = TopKSAEConfig(
             d_model=int(train_x.shape[1]),
             n_features=int(sae_settings.get("n_features", train_x.shape[1] * 4)),
@@ -293,61 +415,39 @@ def run_routerinterp_analysis_pipeline(config: dict[str, Any]) -> dict[str, Any]
         sae, loss_history = fit_topk_sae(
             train_x,
             sae_config,
-            steps=int(sae_settings.get("steps", 10_000)),
-            batch_size=int(sae_settings.get("batch_size", 1024)),
-            learning_rate=float(sae_settings.get("learning_rate", 3e-4)),
-            seed=seed + layer,
+            **sae_training_settings,
         )
         with torch.no_grad():
             train_reconstruction, train_features = sae(train_x)
             eval_reconstruction, eval_features = sae(eval_x)
             train_mse = float(torch.nn.functional.mse_loss(train_reconstruction, train_x).item())
             eval_mse = float(torch.nn.functional.mse_loss(eval_reconstruction, eval_x).item())
-        rho = rho_usefulness(train_features, train_targets)
+        probe_train_features = train_features[:probe_fit_tokens].detach()
+        probe_train_targets = train_targets[:probe_fit_tokens]
+        probe_train_token_ids = train_token_ids[:probe_fit_tokens]
+        probe_train_previous_token_ids = train_previous_token_ids[:probe_fit_tokens]
+        rho = rho_usefulness(probe_train_features, probe_train_targets)
         rho_indices, rho_values = top_rho_features(rho, n_features=top_rho_count)
-        probe = fit_routing_probe(
-            train_features.detach(),
-            train_targets,
-            steps=int(probe_settings.get("steps", 500)),
-            learning_rate=float(probe_settings.get("learning_rate", 1e-3)),
-        )
-        sae_probe_metrics = _probe_metrics(probe, eval_features, eval_targets, top_k=eval_top_k)
-
-        # Matched sparse-basis ablations: raw residual coordinates and PCA
-        # coordinates each retain the same number of active values as the SAE.
-        sparse_neuron_train = sparse_by_magnitude(train_x, k=sae_config.k)
-        sparse_neuron_eval = sparse_by_magnitude(eval_x, k=sae_config.k)
-        neuron_probe = fit_routing_probe(
-            sparse_neuron_train,
-            train_targets,
-            steps=int(probe_settings.get("steps", 500)),
-            learning_rate=float(probe_settings.get("learning_rate", 1e-3)),
-        )
-        neuron_probe_metrics = _probe_metrics(neuron_probe, sparse_neuron_eval, eval_targets, top_k=eval_top_k)
 
         pca_components = min(
-            int(sae_settings.get("pca_components", min(train_x.shape[1], 1024))),
-            int(train_x.shape[0]),
+            int(sae_settings.get("pca_components", train_x.shape[1])),
+            int(probe_train_features.shape[0]),
             int(train_x.shape[1]),
         )
         if pca_components < sae_config.k:
             raise ValueError("`pca_components` must be at least the SAE sparsity `k`.")
-        pca_mean = train_x.mean(0, keepdim=True)
-        _, _, pca_vectors = torch.pca_lowrank(train_x - pca_mean, q=pca_components, center=False)
-        sparse_pca_train = sparse_by_magnitude((train_x - pca_mean) @ pca_vectors, k=sae_config.k)
-        sparse_pca_eval = sparse_by_magnitude((eval_x - pca_mean) @ pca_vectors, k=sae_config.k)
-        pca_probe = fit_routing_probe(
-            sparse_pca_train,
-            train_targets,
-            steps=int(probe_settings.get("steps", 500)),
-            learning_rate=float(probe_settings.get("learning_rate", 1e-3)),
-        )
-        pca_probe_metrics = _probe_metrics(pca_probe, sparse_pca_eval, eval_targets, top_k=eval_top_k)
+        # PCA is fitted only on the same fitting rows available to every
+        # routing-prediction control, never on held-out activations.
+        pca_fit_x = train_x[:probe_fit_tokens]
+        pca_mean = pca_fit_x.mean(0, keepdim=True)
+        _, _, pca_vectors = torch.pca_lowrank(pca_fit_x - pca_mean, q=pca_components, center=False)
+        pca_train = (pca_fit_x - pca_mean) @ pca_vectors
+        pca_eval = (eval_x - pca_mean) @ pca_vectors
 
-        unigram_counts, global_counts = _fit_ngram_counts(train_token_ids, train_targets.cpu())
-        bigram_train_keys = torch.stack((train_previous_token_ids, train_token_ids), dim=1)
+        unigram_counts, global_counts = _fit_ngram_counts(probe_train_token_ids, probe_train_targets.cpu())
+        bigram_train_keys = torch.stack((probe_train_previous_token_ids, probe_train_token_ids), dim=1)
         bigram_eval_keys = torch.stack((eval_previous_token_ids, eval_token_ids), dim=1)
-        bigram_counts, _ = _fit_ngram_counts(bigram_train_keys, train_targets.cpu())
+        bigram_counts, _ = _fit_ngram_counts(bigram_train_keys, probe_train_targets.cpu())
         unigram_scores = _predict_ngram_scores(eval_token_ids, unigram_counts, global_counts).to(device)
         bigram_scores = _predict_ngram_scores(bigram_eval_keys, bigram_counts, global_counts).to(device)
         unigram_predictions = top_k_expert_predictions(unigram_scores, top_k=eval_top_k)
@@ -360,6 +460,62 @@ def run_routerinterp_analysis_pipeline(config: dict[str, Any]) -> dict[str, Any]
             "set_recall_at_k": routing_recall(bigram_scores, eval_targets, top_k=eval_top_k),
             "macro_f1": macro_f1_expert_routing(bigram_predictions, eval_targets),
         }
+
+        active_feature_counts = [int(value) for value in protocol["active_feature_counts"]]
+        if any(value < 1 or value > sae_config.k for value in active_feature_counts):
+            raise ValueError(
+                "Every active_feature_counts value must be in [1, sae.k]; "
+                f"got {active_feature_counts} with sae.k={sae_config.k}."
+            )
+        primary_active_features = int(protocol["primary_active_features"] or max(active_feature_counts))
+        if primary_active_features not in active_feature_counts:
+            raise ValueError("primary_active_features must be included in active_feature_counts.")
+        sae_by_active_features: dict[str, dict[str, float]] = {}
+        neuron_by_active_features: dict[str, dict[str, float]] = {}
+        pca_by_active_features: dict[str, dict[str, float]] = {}
+        primary_sae_probe = None
+        for active_features in active_feature_counts:
+            # RouterInterp evaluates the m largest SAE activations per token.
+            sparse_sae_train = sparse_by_magnitude(probe_train_features, k=active_features)
+            sparse_sae_eval = sparse_by_magnitude(eval_features, k=active_features)
+            probe = fit_routing_probe(
+                sparse_sae_train,
+                probe_train_targets,
+                steps=int(probe_settings.get("steps", 500)),
+                learning_rate=float(probe_settings.get("learning_rate", 1e-3)),
+            )
+            sae_by_active_features[str(active_features)] = _probe_metrics(
+                probe, sparse_sae_eval, eval_targets, top_k=eval_top_k
+            )
+            if active_features == primary_active_features:
+                primary_sae_probe = probe
+
+            # These are additional controls, not claimed RouterInterp baselines:
+            # both retain exactly the same m coordinates as the SAE representation.
+            sparse_neuron_train = sparse_by_magnitude(train_x[:probe_fit_tokens], k=active_features)
+            sparse_neuron_eval = sparse_by_magnitude(eval_x, k=active_features)
+            neuron_probe = fit_routing_probe(
+                sparse_neuron_train,
+                probe_train_targets,
+                steps=int(probe_settings.get("steps", 500)),
+                learning_rate=float(probe_settings.get("learning_rate", 1e-3)),
+            )
+            neuron_by_active_features[str(active_features)] = _probe_metrics(
+                neuron_probe, sparse_neuron_eval, eval_targets, top_k=eval_top_k
+            )
+
+            sparse_pca_train = sparse_by_magnitude(pca_train, k=active_features)
+            sparse_pca_eval = sparse_by_magnitude(pca_eval, k=active_features)
+            pca_probe = fit_routing_probe(
+                sparse_pca_train,
+                probe_train_targets,
+                steps=int(probe_settings.get("steps", 500)),
+                learning_rate=float(probe_settings.get("learning_rate", 1e-3)),
+            )
+            pca_by_active_features[str(active_features)] = _probe_metrics(
+                pca_probe, sparse_pca_eval, eval_targets, top_k=eval_top_k
+            )
+        assert primary_sae_probe is not None
         coactivation = feature_coactivation_ratio(eval_features, rho_indices)
 
         layer_dir = output_dir / f"layer_{layer:02d}"
@@ -367,7 +523,7 @@ def run_routerinterp_analysis_pipeline(config: dict[str, Any]) -> dict[str, Any]
         sae.save_pretrained(str(layer_dir / "topk_sae.pt"))
         torch.save(
             {
-                "probe_state_dict": probe.state_dict(),
+                "probe_state_dict": primary_sae_probe.state_dict(),
                 "n_features": sae_config.n_features,
                 "n_experts": n_experts,
                 "rho": rho.cpu(),
@@ -378,20 +534,32 @@ def run_routerinterp_analysis_pipeline(config: dict[str, Any]) -> dict[str, Any]
         )
         layer_result = {
             "sae_config": asdict(sae_config),
+            "protocol": protocol,
+            "sae_training": sae_training_settings,
+            "probe_training": {
+                "steps": int(probe_settings.get("steps", 500)),
+                "learning_rate": float(probe_settings.get("learning_rate", 1e-3)),
+            },
             "train_tokens": train_token_count,
+            "sae_fit_tokens": sae_fit_tokens,
+            "routing_probe_fit_tokens": probe_fit_tokens,
             "eval_tokens": eval_token_count,
             "num_experts": n_experts,
             "routing_top_k": train_top_k,
             "matched_basis_sparsity": sae_config.k,
             "pca_components": pca_components,
+            "pca_fit_tokens": probe_fit_tokens,
             "train_reconstruction_mse": train_mse,
             "heldout_reconstruction_mse": eval_mse,
             "routing_prediction": {
                 "unigram_baseline": unigram_metrics,
                 "bigram_baseline": bigram_metrics,
-                "neuron_basis_probe": neuron_probe_metrics,
-                "pca_basis_probe": pca_probe_metrics,
-                "sae_predictor": sae_probe_metrics,
+                "sae_predictor": sae_by_active_features[str(primary_active_features)],
+                "sae_predictor_by_active_features": sae_by_active_features,
+                "neuron_basis_probe": neuron_by_active_features[str(primary_active_features)],
+                "neuron_basis_probe_by_active_features": neuron_by_active_features,
+                "pca_basis_probe": pca_by_active_features[str(primary_active_features)],
+                "pca_basis_probe_by_active_features": pca_by_active_features,
             },
             "final_train_loss": loss_history[-1],
             "feature_coactivation": coactivation,
@@ -407,7 +575,7 @@ def run_routerinterp_analysis_pipeline(config: dict[str, Any]) -> dict[str, Any]
         }
         write_json(layer_dir / "summary.json", layer_result)
         results["layers"][str(layer)] = layer_result
-        del train_x, eval_x, train_features, eval_features, sae, probe, neuron_probe, pca_probe
+        del train_x, eval_x, train_features, eval_features, sae, primary_sae_probe
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
