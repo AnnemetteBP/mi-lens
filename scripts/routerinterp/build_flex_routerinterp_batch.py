@@ -52,6 +52,7 @@ def main() -> None:
             "model_name": checkpoint,
             "flexmore_checkpoint": checkpoint,
             "dtype": "bfloat16",
+            "device": "cuda",
             "low_cpu_mem_usage": True,
             "trust_remote_code": True,
         }

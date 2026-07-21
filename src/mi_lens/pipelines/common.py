@@ -16,6 +16,7 @@ from mi_lens.model_paths import resolve_flexmore_checkpoint
 class ModelLoadConfig:
     model_name: str
     dtype: str = "bfloat16"
+    device: str = "cpu"
     trust_remote_code: bool = False
     low_cpu_mem_usage: bool = True
     flexmore_checkpoint: str | None = None
@@ -135,6 +136,9 @@ def load_model_and_tokenizer(
                 "Set MI_LENS_FLEXMORE_MODEL_ROOT when this UCloud path is mounted elsewhere."
             )
 
+    device = torch.device(config.device)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA was requested for this model, but no CUDA device is available.")
     hf_model = transformers.AutoModelForCausalLM.from_pretrained(
         model_source,
         dtype=resolve_torch_dtype(config.dtype),
@@ -142,6 +146,7 @@ def load_model_and_tokenizer(
         low_cpu_mem_usage=config.low_cpu_mem_usage,
         trust_remote_code=config.trust_remote_code,
     )
+    hf_model = hf_model.to(device)
     tokenizer_kwargs: dict[str, Any] = {
         "cache_dir": str(cache_dir),
         "trust_remote_code": config.trust_remote_code,
