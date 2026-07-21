@@ -58,47 +58,70 @@ def main() -> None:
             "trust_remote_code": True,
         }
         base_output = f"tmp/routerinterp/flex/{label}"
+        sae_fit_config = {
+            "project_root": str(project_root),
+            "model": model_config,
+            "output_path": f"{base_output}/streamed_sae",
+            "expert_labels": expert_labels,
+            **capture,
+            **analysis,
+        }
+        if "dataset_config_path" in source:
+            sae_fit_config.update({"dataset_config_path": source["dataset_config_path"], "dataset_role": "sae_fit"})
+        else:
+            sae_fit_config["examples_glob"] = source["sae_fit_glob"]
         train_config = {
             "project_root": str(project_root),
             "model_family": "flex",
             "model_label": label,
             "model": model_config,
-            "examples_glob": source["sae_fit_glob"],
-            "output_path": f"{base_output}/sae_fit",
-            "dataset_split_role": "sae_fit",
+            "output_path": f"{base_output}/probe_fit",
+            "dataset_split_role": "probe_fit",
             "expert_labels": expert_labels,
             **capture,
+            "max_tokens": int(analysis["max_probe_fit_tokens"]),
         }
+        if "dataset_config_path" in source:
+            train_config.update({"dataset_config_path": source["dataset_config_path"], "dataset_role": "sae_fit"})
+        else:
+            train_config["examples_glob"] = source["sae_fit_glob"]
         eval_config = {
             "project_root": str(project_root),
             "model_family": "flex",
             "model_label": label,
             "model": model_config,
-            "examples_glob": source["eval_glob"],
             "output_path": f"{base_output}/eval",
             "dataset_split_role": "eval",
             "expert_labels": expert_labels,
             **capture,
         }
+        if "dataset_config_path" in source:
+            eval_config.update({"dataset_config_path": source["dataset_config_path"], "dataset_role": "eval"})
+        else:
+            eval_config["examples_glob"] = source["eval_glob"]
         analysis_config = {
             "project_root": str(project_root),
-            "train_artifacts_path": f"{base_output}/sae_fit",
+            "train_artifacts_path": f"{base_output}/probe_fit",
             "eval_artifacts_path": f"{base_output}/eval",
+            "pretrained_sae_dir": f"{base_output}/streamed_sae",
             "output_path": f"{base_output}/analysis",
             "layers": "captured",
             "expert_labels": expert_labels,
             **analysis,
         }
-        train_path = generated_dir / label / "capture_sae_fit.json"
+        sae_fit_path = generated_dir / label / "fit_streamed_sae.json"
+        train_path = generated_dir / label / "capture_probe_fit.json"
         eval_path = generated_dir / label / "capture_eval.json"
         analysis_path = generated_dir / label / "analysis.json"
+        _write_json(sae_fit_path, sae_fit_config)
         _write_json(train_path, train_config)
         _write_json(eval_path, eval_config)
         _write_json(analysis_path, analysis_config)
         jobs.append(
             {
                 "name": label,
-                "capture_train_config": str(train_path),
+                "fit_sae_config": str(sae_fit_path),
+                "capture_probe_config": str(train_path),
                 "capture_eval_config": str(eval_path),
                 "analysis_config": str(analysis_path),
             }

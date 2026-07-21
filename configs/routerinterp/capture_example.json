@@ -15,6 +15,6 @@
   "layers": [0],
   "max_examples": 100,
   "max_seq_len": 256,
-  "skip_first_token": true,
+  "skip_first_token": false,
   "artifact_dtype": "bfloat16"
 }

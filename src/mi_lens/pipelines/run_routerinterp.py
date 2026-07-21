@@ -12,6 +12,8 @@ import torch
 from mi_lens.sparse import (
     RouterInterpCaptureConfig,
     TopKSAEConfig,
+    TopKSAE,
+    capture_flexolmo_router_layers,
     capture_routerinterp_prompt_artifacts,
     feature_coactivation_ratio,
     fit_routing_probe,
@@ -25,6 +27,7 @@ from mi_lens.sparse import (
     top_rho_features,
 )
 from mi_lens.adapters.flex_olmo import iter_flex_olmo_layers
+from mi_lens.methods.router_data_prep import iter_router_records_from_config
 
 from .common import (
     ModelLoadConfig,
@@ -60,23 +63,163 @@ def _routerinterp_output_dir(config: dict[str, Any]) -> Path:
     return project_root / "tmp" / "routerinterp" / family / label / split
 
 
+def _iter_jsonl_records(paths: list[Path]):
+    """Yield pooled source-order records without holding a corpus in memory."""
+
+    for path in paths:
+        with path.open(encoding="utf-8") as handle:
+            for line in handle:
+                if line.strip():
+                    yield json.loads(line)
+
+
+def run_routerinterp_streaming_sae_fit_pipeline(config: dict[str, Any]) -> dict[str, Any]:
+    """Fit RouterInterp SAEs directly from model activations without an activation cache."""
+
+    project_root = Path(config["project_root"]).resolve()
+    output_dir = _project_tmp_path(project_root, str(config["output_path"]))
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if "dataset_config_path" in config:
+        paths: list[Path] = []
+        records = iter_router_records_from_config(
+            project_root / str(config["dataset_config_path"]),
+            project_root=project_root,
+            role=str(config.get("dataset_role", "sae_fit")),
+        )
+    else:
+        paths = sorted(project_root.glob(str(config["examples_glob"])))
+        if not paths:
+            raise FileNotFoundError(f"No JSONL files matched {config['examples_glob']!r}.")
+        records = _iter_jsonl_records(paths)
+    model_config = ModelLoadConfig(**config["model"])
+    model, tokenizer, cache_dir = load_model_and_tokenizer(model_config, project_root=project_root)
+    model.eval()
+    device = next(model.parameters()).device
+    target_tokens = int(config["max_sae_fit_tokens"])
+    batch_size = int(config.get("sae", {}).get("batch_size", 1024))
+    learning_rate = float(config.get("sae", {}).get("learning_rate", 3e-4))
+    if target_tokens < 1 or batch_size < 1:
+        raise ValueError("max_sae_fit_tokens and sae.batch_size must be positive.")
+    try:
+        requested_layers = config["layers"]
+        if requested_layers == "routerinterp_quartiles":
+            layer_count = len(iter_flex_olmo_layers(model))
+            layers = tuple((index + 1) * layer_count // 4 - 1 for index in range(4))
+        else:
+            layers = tuple(int(layer) for layer in requested_layers)
+        expert_labels = tuple(str(value) for value in config.get("expert_labels", ()))
+        max_seq_len = config.get("max_seq_len")
+        buffers: dict[int, torch.Tensor] = {}
+        saes: dict[int, TopKSAE] = {}
+        optimizers: dict[int, torch.optim.Optimizer] = {}
+        losses: dict[int, list[float]] = {layer: [] for layer in layers}
+        dataset_tokens: dict[str, int] = {}
+        trained_tokens = 0
+
+        for record in records:
+            if trained_tokens >= target_tokens:
+                break
+            prompt = record.get("prompt", record.get("text"))
+            if prompt is None:
+                continue
+            tokenized = tokenizer(
+                str(prompt), return_tensors="pt", truncation=max_seq_len is not None,
+                **({"max_length": int(max_seq_len)} if max_seq_len is not None else {}),
+            )
+            input_ids = tokenized.input_ids.to(device)
+            captures = capture_flexolmo_router_layers(model, {"input_ids": input_ids})
+            remaining = target_tokens - trained_tokens
+            token_count = min(int(input_ids.shape[1]), remaining)
+            if token_count < 1:
+                continue
+            dataset_name = str(record.get("dataset_name", record.get("task", "unknown")))
+            dataset_tokens[dataset_name] = dataset_tokens.get(dataset_name, 0) + token_count
+            for layer in layers:
+                capture = captures[layer]
+                width = int(capture.router_probabilities.shape[-1])
+                if expert_labels and len(expert_labels) != width:
+                    raise ValueError(f"Configured {len(expert_labels)} labels for a {width}-expert router.")
+                x = capture.router_input[0, :token_count].detach()
+                if layer not in saes:
+                    protocol = _resolve_routerinterp_protocol(config, d_model=int(x.shape[-1]))
+                    sae_config = TopKSAEConfig(
+                        d_model=int(x.shape[-1]),
+                        n_features=int(protocol["sae"].get("n_features", x.shape[-1] * 4)),
+                        k=int(protocol["sae"].get("k", 64)),
+                    )
+                    sae = TopKSAE(sae_config).to(device=device, dtype=x.dtype)
+                    saes[layer] = sae
+                    optimizers[layer] = torch.optim.Adam(sae.parameters(), lr=learning_rate)
+                    buffers[layer] = x.new_empty((0, x.shape[-1]))
+                buffers[layer] = torch.cat((buffers[layer], x), dim=0)
+                while buffers[layer].shape[0] >= batch_size:
+                    batch, buffers[layer] = buffers[layer][:batch_size], buffers[layer][batch_size:]
+                    reconstruction, _ = saes[layer](batch)
+                    loss = torch.nn.functional.mse_loss(reconstruction, batch)
+                    optimizers[layer].zero_grad(set_to_none=True)
+                    loss.backward()
+                    optimizers[layer].step()
+                    saes[layer].normalize_decoder()
+                    losses[layer].append(float(loss.detach().item()))
+            trained_tokens += token_count
+
+        if trained_tokens != target_tokens:
+            raise ValueError(f"Only {trained_tokens:,} source tokens available; need {target_tokens:,} for SAE fitting.")
+        for layer, sae in saes.items():
+            # Train on any final short batch so the declared token budget is exact.
+            if buffers[layer].numel():
+                reconstruction, _ = sae(buffers[layer])
+                loss = torch.nn.functional.mse_loss(reconstruction, buffers[layer])
+                optimizers[layer].zero_grad(set_to_none=True)
+                loss.backward()
+                optimizers[layer].step()
+                sae.normalize_decoder()
+                losses[layer].append(float(loss.detach().item()))
+            layer_dir = output_dir / f"layer_{layer:02d}"
+            layer_dir.mkdir(parents=True, exist_ok=True)
+            sae.eval().save_pretrained(str(layer_dir / "topk_sae.pt"))
+        manifest = {
+            "format": "mi_lens.routerinterp.streaming_sae.v1",
+            "trained_tokens_per_layer": trained_tokens,
+            "layers": list(layers),
+            "dataset_tokens": dataset_tokens,
+            "expert_labels": list(expert_labels),
+            "source_paths": [str(path) for path in paths],
+            "dataset_config_path": config.get("dataset_config_path"),
+            "final_loss": {str(layer): values[-1] for layer, values in losses.items() if values},
+            "cache_dir": str(cache_dir),
+        }
+        write_json(output_dir / "sae_fit_manifest.json", manifest)
+        return {"output_dir": str(output_dir), "manifest_path": str(output_dir / "sae_fit_manifest.json"), **manifest}
+    finally:
+        clear_runtime_state(model, tokenizer)
+
+
 def run_routerinterp_capture_pipeline(config: dict[str, Any]) -> dict[str, Any]:
     """Capture pre-router vectors and routing labels from a fixed JSONL split."""
 
     project_root = Path(config["project_root"]).resolve()
     model_config = ModelLoadConfig(**config["model"])
     output_dir = _routerinterp_output_dir(config)
-    if "examples_path" in config:
-        example_paths = [project_root / str(config["examples_path"])]
-    elif "examples_glob" in config:
-        example_paths = sorted(project_root.glob(str(config["examples_glob"])))
-        if not example_paths:
-            raise FileNotFoundError(f"No JSONL files matched {config['examples_glob']!r}.")
+    if "dataset_config_path" in config:
+        example_paths: list[Path] = []
+        records = list(iter_router_records_from_config(
+            project_root / str(config["dataset_config_path"]),
+            project_root=project_root,
+            role=str(config.get("dataset_role", "eval")),
+        ))
     else:
-        raise KeyError("RouterInterp capture requires `examples_path` or `examples_glob`.")
-    records = []
-    for example_path in example_paths:
-        records.extend(load_jsonl_records(example_path))
+        if "examples_path" in config:
+            example_paths = [project_root / str(config["examples_path"])]
+        elif "examples_glob" in config:
+            example_paths = sorted(project_root.glob(str(config["examples_glob"])))
+            if not example_paths:
+                raise FileNotFoundError(f"No JSONL files matched {config['examples_glob']!r}.")
+        else:
+            raise KeyError("RouterInterp capture requires a dataset config, examples_path, or examples_glob.")
+        records = []
+        for example_path in example_paths:
+            records.extend(load_jsonl_records(example_path))
     if config.get("max_examples") is not None:
         records = records[: int(config["max_examples"])]
     model, tokenizer, cache_dir = load_model_and_tokenizer(model_config, project_root=project_root)
@@ -94,8 +237,9 @@ def run_routerinterp_capture_pipeline(config: dict[str, Any]) -> dict[str, Any]:
             layers=layers,
             expert_labels=tuple(str(label) for label in config.get("expert_labels", ())),
             max_seq_len=None if config.get("max_seq_len") is None else int(config["max_seq_len"]),
-            skip_first_token=bool(config.get("skip_first_token", True)),
+            skip_first_token=bool(config.get("skip_first_token", False)),
             artifact_dtype=str(config.get("artifact_dtype", "bfloat16")),
+            max_tokens=None if config.get("max_tokens") is None else int(config["max_tokens"]),
         )
         manifest = capture_routerinterp_prompt_artifacts(
             model,
@@ -328,9 +472,10 @@ def run_routerinterp_analysis_pipeline(config: dict[str, Any]) -> dict[str, Any]
     eval_dir = _project_tmp_path(project_root, str(config["eval_artifacts_path"]))
     if train_dir.resolve() == eval_dir.resolve():
         raise ValueError("RouterInterp train and evaluation artifact directories must differ.")
+    pretrained_sae_dir = config.get("pretrained_sae_dir")
     if str(config.get("protocol", "custom")) == "routerinterp_olmoe_topk" and bool(
         config.get("strict_token_budgets", True)
-    ):
+    ) and not pretrained_sae_dir:
         required_tokens = int(config.get("max_sae_fit_tokens", 100_000_000))
         available_tokens = _captured_token_count(train_dir)
         if available_tokens < required_tokens:
@@ -339,6 +484,14 @@ def run_routerinterp_analysis_pipeline(config: dict[str, Any]) -> dict[str, Any]
                 f"the captured fitting artifacts contain {available_tokens:,}. "
                 "Use the custom pilot profile for a smaller study rather than labelling it paper-scale."
             )
+    if pretrained_sae_dir:
+        pretrained_root = _project_tmp_path(project_root, str(pretrained_sae_dir))
+        fit_manifest = json.loads((pretrained_root / "sae_fit_manifest.json").read_text(encoding="utf-8"))
+        required_tokens = int(config.get("max_sae_fit_tokens", 100_000_000))
+        if bool(config.get("strict_token_budgets", True)) and int(
+            fit_manifest.get("trained_tokens_per_layer", 0)
+        ) < required_tokens:
+            raise ValueError("The streamed SAE checkpoint does not meet the configured SAE token budget.")
     output_dir = _project_tmp_path(
         project_root,
         str(config.get("output_path", "tmp/routerinterp/analysis")),
@@ -406,7 +559,12 @@ def run_routerinterp_analysis_pipeline(config: dict[str, Any]) -> dict[str, Any]
         protocol = _resolve_routerinterp_protocol(config, d_model=int(train_x.shape[1]))
         sae_fit_tokens = protocol["sae_fit_tokens"]
         probe_fit_tokens = protocol["probe_fit_tokens"]
-        if sae_fit_tokens is not None:
+        if pretrained_sae_dir:
+            # The large SAE corpus was consumed by the streamed trainer. These
+            # retained train artifacts are only for the 1M-token probe controls.
+            sae_fit_tokens = int(fit_manifest["trained_tokens_per_layer"])
+            probe_fit_tokens = min(int(probe_fit_tokens), train_token_count)
+        elif sae_fit_tokens is not None:
             sae_fit_tokens = min(int(sae_fit_tokens), train_token_count)
         else:
             sae_fit_tokens = train_token_count
@@ -414,7 +572,7 @@ def run_routerinterp_analysis_pipeline(config: dict[str, Any]) -> dict[str, Any]
             probe_fit_tokens = min(int(probe_fit_tokens), sae_fit_tokens)
         else:
             probe_fit_tokens = sae_fit_tokens
-        if protocol["strict_token_budgets"] and (
+        if not pretrained_sae_dir and protocol["strict_token_budgets"] and (
             sae_fit_tokens != int(protocol["sae_fit_tokens"])
             or probe_fit_tokens != int(protocol["probe_fit_tokens"])
         ):
@@ -423,11 +581,12 @@ def run_routerinterp_analysis_pipeline(config: dict[str, Any]) -> dict[str, Any]
                 f"need {protocol['sae_fit_tokens']:,} SAE-fitting tokens and "
                 f"{protocol['probe_fit_tokens']:,} routing-probe tokens; found {train_token_count:,}."
             )
-        train_x = train_x[:sae_fit_tokens]
-        train_selected = train_selected[:sae_fit_tokens]
-        train_token_ids = train_token_ids[:sae_fit_tokens]
-        train_previous_token_ids = train_previous_token_ids[:sae_fit_tokens]
-        train_token_count = sae_fit_tokens
+        retained_train_tokens = probe_fit_tokens if pretrained_sae_dir else sae_fit_tokens
+        train_x = train_x[:retained_train_tokens]
+        train_selected = train_selected[:retained_train_tokens]
+        train_token_ids = train_token_ids[:retained_train_tokens]
+        train_previous_token_ids = train_previous_token_ids[:retained_train_tokens]
+        train_token_count = retained_train_tokens
 
         train_x = train_x.to(device)
         eval_x = eval_x.to(device)
@@ -445,11 +604,13 @@ def run_routerinterp_analysis_pipeline(config: dict[str, Any]) -> dict[str, Any]
             n_features=int(sae_settings.get("n_features", train_x.shape[1] * 4)),
             k=int(sae_settings.get("k", 64)),
         )
-        sae, loss_history = fit_topk_sae(
-            train_x,
-            sae_config,
-            **sae_training_settings,
-        )
+        if pretrained_sae_dir:
+            sae = TopKSAE.from_pretrained(pretrained_root / f"layer_{layer:02d}" / "topk_sae.pt").to(device)
+            if sae.config != sae_config:
+                raise ValueError(f"Pretrained SAE at layer {layer} does not match the requested protocol.")
+            loss_history = []
+        else:
+            sae, loss_history = fit_topk_sae(train_x, sae_config, **sae_training_settings)
         with torch.no_grad():
             train_reconstruction, train_features = sae(train_x)
             eval_reconstruction, eval_features = sae(eval_x)
@@ -596,7 +757,7 @@ def run_routerinterp_analysis_pipeline(config: dict[str, Any]) -> dict[str, Any]
                 "pca_basis_probe": pca_by_active_features[str(primary_active_features)],
                 "pca_basis_probe_by_active_features": pca_by_active_features,
             },
-            "final_train_loss": loss_history[-1],
+            "final_train_loss": loss_history[-1] if loss_history else None,
             "feature_coactivation": coactivation,
             "top_rho_features": [
                 {

@@ -3,6 +3,7 @@
   "batch_name": "flex_routerinterp_paper_protocol",
   "continue_on_error": true,
   "source": {
+    "dataset_config_path": "configs/routerinterp/datasets_streaming.json",
     "sae_fit_glob": "data/router/sae_fit/*.jsonl",
     "eval_glob": "data/router/eval/*.jsonl"
   },
@@ -10,7 +11,7 @@
     "layers": "routerinterp_quartiles",
     "max_examples": null,
     "max_seq_len": null,
-    "skip_first_token": true,
+    "skip_first_token": false,
     "artifact_dtype": "bfloat16"
   },
   "analysis": {

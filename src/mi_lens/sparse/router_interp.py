@@ -29,8 +29,9 @@ class RouterInterpCaptureConfig:
     layers: tuple[int, ...]
     expert_labels: tuple[str, ...] = ()
     max_seq_len: int | None = None
-    skip_first_token: bool = True
+    skip_first_token: bool = False
     artifact_dtype: str = "bfloat16"
+    max_tokens: int | None = None
 
 
 def _as_batch_sequence(tensor: torch.Tensor, batch_size: int, sequence_length: int) -> torch.Tensor:
@@ -126,9 +127,12 @@ def capture_routerinterp_prompt_artifacts(
     embedding = model.get_input_embeddings()
     device = embedding.weight.device
     manifest = []
+    captured_tokens = 0
     selected_layers = tuple(sorted(set(int(layer) for layer in config.layers)))
 
     for prompt_index, example in enumerate(examples):
+        if config.max_tokens is not None and captured_tokens >= config.max_tokens:
+            break
         prompt = example.get("prompt", example.get("text"))
         if prompt is None:
             raise KeyError("RouterInterp examples require `prompt` or `text`.")
@@ -140,8 +144,11 @@ def capture_routerinterp_prompt_artifacts(
         token_count = int(input_ids.shape[1])
         start = 1 if config.skip_first_token else 0
         # RouterInterp explains routing at every real token position. Unlike a
-        # next-token lens, it has no reason to discard the final token.
+        # next-token lens, it has no reason to discard either boundary token.
         positions = list(range(start, token_count))
+        if config.max_tokens is not None:
+            remaining = config.max_tokens - captured_tokens
+            positions = positions[: max(0, remaining)]
         if not positions:
             continue
         captures = capture_flexolmo_router_layers(model, {"input_ids": input_ids})
@@ -166,6 +173,10 @@ def capture_routerinterp_prompt_artifacts(
             {
                 "prompt_index": prompt_index,
                 "example_id": str(example.get("id", example.get("example_id", prompt_index))),
+                "dataset_name": str(example.get("dataset_name", example.get("task", "unknown"))),
+                "task": str(example.get("task", "unknown")),
+                "domain": str(example.get("domain", "unknown")),
+                "language": str(example.get("language", "unknown")),
                 "prompt": str(prompt),
                 "token_ids": input_ids[0].cpu(),
                 "positions": torch.tensor(positions, dtype=torch.int32),
@@ -177,16 +188,21 @@ def capture_routerinterp_prompt_artifacts(
             {
                 "prompt_index": prompt_index,
                 "example_id": str(example.get("id", example.get("example_id", prompt_index))),
+                "dataset_name": str(example.get("dataset_name", example.get("task", "unknown"))),
+                "task": str(example.get("task", "unknown")),
+                "domain": str(example.get("domain", "unknown")),
+                "language": str(example.get("language", "unknown")),
                 "path": file_name,
                 "num_tokens": len(positions),
             }
         )
+        captured_tokens += len(positions)
 
     payload = {
         "format": "mi_lens.routerinterp.v1",
         "config": asdict(config),
         "num_prompts": len(manifest),
-        "num_tokens": sum(row["num_tokens"] for row in manifest),
+        "num_tokens": captured_tokens,
         "prompts": manifest,
     }
     (output_dir / "manifest.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")

@@ -100,6 +100,12 @@ def configure_hf_cache(project_root: str | Path) -> Path:
     os.environ["TMPDIR"] = str(runtime_dir)
     os.environ["TMP"] = str(runtime_dir)
     os.environ["TEMP"] = str(runtime_dir)
+    env_path = paths.root / ".env"
+    if not os.environ.get("HF_TOKEN") and env_path.is_file():
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            if line.startswith("HF_TOKEN="):
+                os.environ["HF_TOKEN"] = line.split("=", 1)[1].strip().strip("\"'")
+                break
     return cache_dir
 
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -44,7 +45,7 @@ class RouterDatasetExportSpec:
     revision: str | None = None
     data_file: str | None = None
     start_idx: int = 0
-    max_records: int = 100
+    max_records: int | None = 100
     filter_field: str | None = None
     filter_value: Any = None
     text_field: str = "text"
@@ -56,6 +57,7 @@ class RouterDatasetExportSpec:
     prompt_prefix: str = ""
     prompt_suffix: str = ""
     shuffle_on_load: bool = False
+    loader: str = "huggingface"
 
 
 @dataclass(slots=True)
@@ -88,18 +90,66 @@ def _configure_hf_cache(cache_dir: Path) -> None:
     os.environ["HF_HOME"] = str(cache_dir)
     os.environ["HUGGINGFACE_HUB_CACHE"] = str(cache_dir / "hub")
     os.environ["HF_DATASETS_CACHE"] = str(cache_dir / "datasets")
+    env_path = cache_dir.parents[1] / ".env"
+    if not os.environ.get("HF_TOKEN") and env_path.is_file():
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            if line.startswith("HF_TOKEN="):
+                os.environ["HF_TOKEN"] = line.split("=", 1)[1].strip().strip("\"'")
+                break
+
+
+def _load_euroeval_dataset(spec: RouterDatasetExportSpec, cache_dir: Path):
+    """Load a Danish EuroEval split through the vendored EuroEval definitions."""
+
+    project_root = cache_dir.parents[1]
+    euroeval_src = project_root / "FlexEval" / "EuroEval" / "src"
+    if not euroeval_src.is_dir():
+        raise FileNotFoundError(f"Missing vendored EuroEval source at {euroeval_src}.")
+    if str(euroeval_src) not in sys.path:
+        sys.path.insert(0, str(euroeval_src))
+    from euroeval.data_loading import load_raw_data
+    from euroeval.data_models import DatasetConfig
+    from euroeval.dataset_configs import danish
+
+    config = next(
+        (
+            value
+            for value in vars(danish).values()
+            if isinstance(value, DatasetConfig) and value.name == spec.dataset_name
+        ),
+        None,
+    )
+    if config is None:
+        raise KeyError(f"Unknown vendored EuroEval Danish dataset {spec.dataset_name!r}.")
+    dataset = load_raw_data(
+        config,
+        cache_dir=str(cache_dir),
+        api_key=os.environ.get("HF_TOKEN"),
+    )
+    if config.preprocessing_func is not None:
+        dataset = config.preprocessing_func(dataset)
+    if spec.split not in dataset:
+        raise ValueError(
+            f"EuroEval dataset {spec.dataset_name!r} has no {spec.split!r} split; "
+            f"available splits: {sorted(dataset)}."
+        )
+    return dataset[spec.split], config
 
 
 def _load_router_dataset(spec: RouterDatasetExportSpec, cache_dir: Path):
     """Load a Hub dataset, using its Parquet conversion when scripts are retired."""
 
+    if spec.loader == "euroeval":
+        return _load_euroeval_dataset(spec, cache_dir)
+    if spec.loader != "huggingface":
+        raise ValueError(f"Unsupported router dataset loader {spec.loader!r}.")
     if spec.data_file is not None:
         return load_dataset(
             "parquet",
             data_files={spec.split: spec.data_file},
             split=spec.split,
             cache_dir=str(cache_dir),
-        )
+        ), None
 
     conversion_config = _PARQUET_CONVERSION_CONFIGS.get(spec.dataset_name)
     if conversion_config is None:
@@ -109,7 +159,7 @@ def _load_router_dataset(spec: RouterDatasetExportSpec, cache_dir: Path):
             split=spec.split,
             revision=spec.revision,
             cache_dir=str(cache_dir),
-        )
+        ), None
 
     config_name = spec.config_name or conversion_config
     data_file = (
@@ -121,7 +171,7 @@ def _load_router_dataset(spec: RouterDatasetExportSpec, cache_dir: Path):
         data_files={spec.split: data_file},
         split=spec.split,
         cache_dir=str(cache_dir),
-    )
+    ), None
 
 
 def _require_field(item: dict[str, Any], field: str, *, source_idx: int) -> Any:
@@ -177,7 +227,13 @@ def _apply_template(template: str, item: dict[str, Any], *, source_idx: int) -> 
     return template.format_map(RequiredFields({key: _as_text(value) for key, value in item.items()}))
 
 
-def _build_row(spec: RouterDatasetExportSpec, item: dict[str, Any], source_idx: int) -> dict[str, Any]:
+def _build_row(
+    spec: RouterDatasetExportSpec,
+    item: dict[str, Any],
+    source_idx: int,
+    *,
+    euroeval_config: Any = None,
+) -> dict[str, Any]:
     adapter = spec.adapter
     choices: list[Any] | None = None
     gold: int | str | None = None
@@ -185,6 +241,18 @@ def _build_row(spec: RouterDatasetExportSpec, item: dict[str, Any], source_idx: 
 
     if adapter == "text":
         prompt = _as_text(_require_field(item, spec.text_field, source_idx=source_idx))
+    elif adapter == "euroeval":
+        if euroeval_config is None:
+            raise ValueError("adapter='euroeval' requires loader='euroeval'.")
+        values = {key: _as_text(value) for key, value in item.items()}
+        values["text"] = _as_text(_require_field(item, "text", source_idx=source_idx))
+        values["label"] = ""
+        values["target_text"] = ""
+        values["labels_str"] = euroeval_config.get_labels_str()
+        prompt = euroeval_config.prompt_template.format(**values)
+        if euroeval_config.prompt_prefix:
+            prompt = euroeval_config.prompt_prefix.format(labels_str=values["labels_str"]) + "\n\n" + prompt
+        gold = item.get("label", item.get("target_text"))
     elif adapter == "template":
         if not spec.prompt_template:
             raise ValueError(f"{spec.name}: adapter='template' requires prompt_template.")
@@ -255,6 +323,9 @@ def _build_row(spec: RouterDatasetExportSpec, item: dict[str, Any], source_idx: 
     native_id = item.get(spec.native_id_field) if spec.native_id_field else None
     return {
         "id": f"{spec.name}:{source_idx}",
+        # Keep a simple, stable label alongside the full source provenance so
+        # pooled SAE captures can later be partitioned by dataset.
+        "dataset_name": spec.name,
         "prompt": f"{spec.prompt_prefix}{prompt.strip()}{spec.prompt_suffix}",
         "task": spec.name,
         "domain": spec.domain,
@@ -299,12 +370,12 @@ def export_router_dataset_to_jsonl(
         raise ValueError("Router datasets must preserve Hugging Face source order; shuffle is disabled.")
     if spec.role not in {"sae_fit", "eval"}:
         raise ValueError(f"Unsupported router dataset role {spec.role!r}.")
-    if spec.max_records < 1:
+    if spec.max_records is not None and spec.max_records < 1:
         raise ValueError("max_records must be at least one.")
 
     cache_path = Path(cache_dir)
     _configure_hf_cache(cache_path)
-    dataset = _load_router_dataset(spec, cache_path)
+    dataset, euroeval_config = _load_router_dataset(spec, cache_path)
 
     rows: list[dict[str, Any]] = []
     dropped = 0
@@ -315,12 +386,12 @@ def export_router_dataset_to_jsonl(
         item = dict(dataset[source_idx])
         if not _matches_spec(spec, item):
             continue
-        row = _build_row(spec, item, source_idx)
+        row = _build_row(spec, item, source_idx, euroeval_config=euroeval_config)
         if not row["prompt"]:
             dropped += 1
             continue
         rows.append(row)
-        if len(rows) >= spec.max_records:
+        if spec.max_records is not None and len(rows) >= spec.max_records:
             break
 
     if not rows:
@@ -433,3 +504,31 @@ def prepare_router_datasets_from_config(
         encoding="utf-8",
     )
     return manifests
+
+
+def iter_router_records_from_config(config_path: str | Path, *, project_root: str | Path, role: str):
+    """Stream source-order router rows from providers without creating JSONL files."""
+
+    config = json.loads(Path(config_path).read_text(encoding="utf-8"))
+    paths = router_data_paths(project_root)
+    _configure_hf_cache(paths.cache_dir)
+    for raw_spec in config.get(role, []):
+        if not raw_spec.get("enabled", True):
+            continue
+        values = dict(raw_spec)
+        values.pop("enabled", None)
+        values["role"] = role
+        values["output_path"] = paths.data_root / ".streaming_unused.jsonl"
+        spec = RouterDatasetExportSpec(**values)
+        dataset, euroeval_config = _load_router_dataset(spec, paths.cache_dir)
+        emitted = 0
+        for source_idx in range(max(0, int(spec.start_idx)), len(dataset)):
+            item = dict(dataset[source_idx])
+            if not _matches_spec(spec, item):
+                continue
+            row = _build_row(spec, item, source_idx, euroeval_config=euroeval_config)
+            if row["prompt"]:
+                yield row
+                emitted += 1
+            if spec.max_records is not None and emitted >= spec.max_records:
+                break

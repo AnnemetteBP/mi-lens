@@ -22,12 +22,14 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[2]
 STAGE_SCRIPTS = {
-    "capture_train": ROOT / "scripts" / "routerinterp" / "capture_routerinterp.py",
+    "fit_sae": ROOT / "scripts" / "routerinterp" / "fit_routerinterp_sae.py",
+    "capture_probe": ROOT / "scripts" / "routerinterp" / "capture_routerinterp.py",
     "capture_eval": ROOT / "scripts" / "routerinterp" / "capture_routerinterp.py",
     "analysis": ROOT / "scripts" / "routerinterp" / "analyze_routerinterp.py",
 }
 STAGE_OUTPUT_FILE = {
-    "capture_train": "manifest.json",
+    "fit_sae": "sae_fit_manifest.json",
+    "capture_probe": "manifest.json",
     "capture_eval": "manifest.json",
     "analysis": "summary.json",
 }
@@ -188,7 +190,7 @@ def main() -> None:
             raise ValueError(f"Job {job_index} must be a JSON object.")
         job_name = str(job.get("name", f"job_{job_index:02d}"))
         try:
-            for stage in ("capture_train", "capture_eval", "analysis"):
+            for stage in ("fit_sae", "capture_probe", "capture_eval", "analysis"):
                 config_value = job.get(f"{stage}_config")
                 if not config_value:
                     raise ValueError(f"{job_name} is missing `{stage}_config`.")

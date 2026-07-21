@@ -24,6 +24,7 @@ from .run_sparse_capture import run_sparse_capture_pipeline
 from .run_routerinterp import (
     run_routerinterp_analysis_pipeline,
     run_routerinterp_capture_pipeline,
+    run_routerinterp_streaming_sae_fit_pipeline,
 )
 from .run_tokenization_audit import run_tokenization_audit_pipeline
 from .run_tuned_lens_train import run_tuned_lens_train_pipeline
@@ -46,6 +47,7 @@ __all__ = [
     "run_sparse_capture_pipeline",
     "run_routerinterp_analysis_pipeline",
     "run_routerinterp_capture_pipeline",
+    "run_routerinterp_streaming_sae_fit_pipeline",
     "run_tokenization_audit_pipeline",
     "run_tuned_lens_train_pipeline",
     "write_json",
