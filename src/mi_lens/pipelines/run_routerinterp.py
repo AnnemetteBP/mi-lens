@@ -183,6 +183,14 @@ def run_routerinterp_streaming_sae_fit_pipeline(config: dict[str, Any]) -> dict[
         itda_sampled_tokens = 0
         dataset_tokens: dict[str, int] = {}
         trained_tokens = 0
+        progress_every_tokens = int(config.get("progress_every_tokens", 1_000_000))
+        if progress_every_tokens < 1:
+            raise ValueError("progress_every_tokens must be positive.")
+        next_progress_tokens = progress_every_tokens
+        print(
+            f"[progress] SAE/ITDA fit: 0/{target_tokens:,} tokens; layers={list(layers)}",
+            flush=True,
+        )
 
         for record in records:
             if trained_tokens >= target_tokens:
@@ -262,6 +270,14 @@ def run_routerinterp_streaming_sae_fit_pipeline(config: dict[str, Any]) -> dict[
             if sample_indices is not None:
                 itda_sampled_tokens += int(sample_indices.numel())
             trained_tokens += token_count
+            if trained_tokens >= next_progress_tokens or trained_tokens == target_tokens:
+                print(
+                    f"[progress] SAE/ITDA fit: {trained_tokens:,}/{target_tokens:,} tokens "
+                    f"({100.0 * trained_tokens / target_tokens:.1f}%); "
+                    f"ITDA sampled={itda_sampled_tokens:,}/{itda_fit_tokens:,}",
+                    flush=True,
+                )
+                next_progress_tokens += progress_every_tokens
 
         if trained_tokens != target_tokens:
             raise ValueError(f"Only {trained_tokens:,} source tokens available; need {target_tokens:,} for SAE fitting.")
@@ -1459,6 +1475,7 @@ def run_routerinterp_analysis_pipeline(config: dict[str, Any]) -> dict[str, Any]
     }
 
     for layer in layers:
+        print(f"[progress] held-out analysis: layer {layer} ({layers.index(layer) + 1}/{len(layers)})", flush=True)
         (
             train_x,
             train_selected,

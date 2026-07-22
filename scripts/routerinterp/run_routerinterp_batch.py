@@ -125,15 +125,23 @@ def _run_stage(
     print(f"[start] {job_name}: {stage}; log: {log_path}", flush=True)
     with log_path.open("a", encoding="utf-8") as log_file:
         log_file.write(f"\n[{_now()}] $ {' '.join(command)}\n")
-        completed = subprocess.run(
+        process = subprocess.Popen(
             command,
             cwd=project_root,
             env=environment,
-            stdout=log_file,
+            stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            check=False,
+            text=True,
+            bufsize=1,
         )
-    if completed.returncode != 0:
+        assert process.stdout is not None
+        for line in process.stdout:
+            log_file.write(line)
+            log_file.flush()
+            if line.startswith("[progress]"):
+                print(f"[{job_name}: {stage}] {line}", end="", flush=True)
+        returncode = process.wait()
+    if returncode != 0:
         _write_json_atomic(
             marker_path,
             {
@@ -144,10 +152,10 @@ def _run_stage(
                 "output_path": str(output_path),
                 "required_file": required_file,
                 "log_path": str(log_path),
-                "returncode": completed.returncode,
+                "returncode": returncode,
             },
         )
-        raise RuntimeError(f"{job_name}: {stage} failed (exit {completed.returncode}); see {log_path}")
+        raise RuntimeError(f"{job_name}: {stage} failed (exit {returncode}); see {log_path}")
     if not (output_path / required_file).is_file():
         raise RuntimeError(f"{job_name}: {stage} exited successfully but did not write {output_path / required_file}")
     _write_json_atomic(
