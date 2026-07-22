@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,8 @@ import torch
 
 from mi_lens.sparse import (
     RouterInterpCaptureConfig,
+    ITDA,
+    ITDAConfig,
     TopKSAEConfig,
     TopKSAE,
     capture_flexolmo_router_layers,
@@ -39,6 +42,47 @@ from .common import (
     slugify,
     write_json,
 )
+
+
+def _require_finite_tensor(name: str, values: torch.Tensor) -> None:
+    if not torch.isfinite(values).all():
+        raise ValueError(f"{name} contains NaN or infinity.")
+
+
+def _require_probability_matrix(name: str, values: torch.Tensor) -> None:
+    if values.ndim != 2 or values.shape[1] < 1:
+        raise ValueError(f"{name} must be shaped (token, expert).")
+    _require_finite_tensor(name, values)
+    tolerance = 2e-3 if values.dtype in (torch.float16, torch.bfloat16) else 1e-5
+    if (values < -tolerance).any() or (values > 1.0 + tolerance).any():
+        raise ValueError(f"{name} contains values outside [0, 1].")
+    sums = values.float().sum(-1)
+    if not torch.allclose(sums, torch.ones_like(sums), rtol=tolerance, atol=tolerance):
+        raise ValueError(f"{name} rows are not normalised.")
+
+
+def _checked_metric(name: str, value: float, *, lower: float | None = None, upper: float | None = None) -> float:
+    if not torch.isfinite(torch.tensor(value)):
+        raise ValueError(f"{name} is NaN or infinity.")
+    tolerance = 1e-5
+    if lower is not None and value < lower - tolerance:
+        raise ValueError(f"{name}={value} is below {lower}.")
+    if upper is not None and value > upper + tolerance:
+        raise ValueError(f"{name}={value} is above {upper}.")
+    return float(value)
+
+
+def _require_json_finite(value: Any, *, path: str = "result") -> None:
+    """Prevent JSON summaries from serialising a latent NaN/Inf anywhere."""
+
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            _require_json_finite(nested, path=f"{path}.{key}")
+    elif isinstance(value, list):
+        for index, nested in enumerate(value):
+            _require_json_finite(nested, path=f"{path}[{index}]")
+    elif isinstance(value, float) and not torch.isfinite(torch.tensor(value)):
+        raise ValueError(f"{path} is NaN or infinity.")
 
 
 def _project_tmp_path(project_root: Path, relative_path: str) -> Path:
@@ -115,6 +159,21 @@ def run_routerinterp_streaming_sae_fit_pipeline(config: dict[str, Any]) -> dict[
         saes: dict[int, TopKSAE] = {}
         optimizers: dict[int, torch.optim.Optimizer] = {}
         losses: dict[int, list[float]] = {layer: [] for layer in layers}
+        itda_settings = dict(config.get("itda", {}))
+        itda_enabled = bool(itda_settings.get("enabled", False))
+        itda_fit_tokens = int(itda_settings.get("fit_tokens", 1_000_000)) if itda_enabled else 0
+        itda_batch_size = int(itda_settings.get("batch_size", 64)) if itda_enabled else 0
+        if itda_enabled and (itda_fit_tokens < 1 or itda_batch_size < 1):
+            raise ValueError("ITDA fit_tokens and batch_size must be positive.")
+        # ITDA is documented as a lightweight, million-token alternative to
+        # SAE training.  Select a fixed source-order stride from the exact SAE
+        # stream so no second model pass or activation cache is required.
+        # Floor rather than ceil so the deterministic source-order sample has
+        # at least the requested budget before the final exact truncation.
+        itda_stride = max(1, target_tokens // itda_fit_tokens) if itda_enabled else 0
+        itdas: dict[int, ITDA] = {}
+        itda_history: dict[int, list[dict[str, float | int]]] = {layer: [] for layer in layers}
+        itda_sampled_tokens = 0
         dataset_tokens: dict[str, int] = {}
         trained_tokens = 0
 
@@ -136,6 +195,11 @@ def run_routerinterp_streaming_sae_fit_pipeline(config: dict[str, Any]) -> dict[
                 continue
             dataset_name = str(record.get("dataset_name", record.get("task", "unknown")))
             dataset_tokens[dataset_name] = dataset_tokens.get(dataset_name, 0) + token_count
+            sample_indices = None
+            if itda_enabled and itda_sampled_tokens < itda_fit_tokens:
+                offsets = torch.arange(token_count, device=device) + trained_tokens
+                sample_indices = torch.nonzero(offsets.remainder(itda_stride) == 0, as_tuple=False).flatten()
+                sample_indices = sample_indices[: itda_fit_tokens - itda_sampled_tokens]
             for layer in layers:
                 capture = captures[layer]
                 width = int(capture.router_probabilities.shape[-1])
@@ -163,10 +227,41 @@ def run_routerinterp_streaming_sae_fit_pipeline(config: dict[str, Any]) -> dict[
                     optimizers[layer].step()
                     saes[layer].normalize_decoder()
                     losses[layer].append(float(loss.detach().item()))
+                if itda_enabled and sample_indices is not None and sample_indices.numel():
+                    if layer not in itdas:
+                        itda_config = ITDAConfig(
+                            d_model=int(x.shape[-1]),
+                            max_atoms=int(itda_settings.get("max_atoms", x.shape[-1] * 16)),
+                            k=int(itda_settings.get("k", 32)),
+                            loss_threshold=float(itda_settings.get("loss_threshold", 0.01)),
+                        )
+                        itdas[layer] = ITDA(itda_config).to(device=device, dtype=x.dtype)
+                    samples = x.index_select(0, sample_indices)
+                    # Retain globally stable source positions for atom provenance.
+                    sample_provenance = torch.stack(
+                        (
+                            sample_indices + trained_tokens,
+                            sample_indices,
+                        ),
+                        dim=1,
+                    )
+                    for start in range(0, samples.shape[0], itda_batch_size):
+                        itda_history[layer].append(
+                            itdas[layer].update(
+                                samples[start : start + itda_batch_size],
+                                source_indices=sample_provenance[start : start + itda_batch_size],
+                            )
+                        )
+            if sample_indices is not None:
+                itda_sampled_tokens += int(sample_indices.numel())
             trained_tokens += token_count
 
         if trained_tokens != target_tokens:
             raise ValueError(f"Only {trained_tokens:,} source tokens available; need {target_tokens:,} for SAE fitting.")
+        if itda_enabled and itda_sampled_tokens != itda_fit_tokens:
+            raise ValueError(
+                f"ITDA received {itda_sampled_tokens:,} source tokens; expected exactly {itda_fit_tokens:,}."
+            )
         for layer, sae in saes.items():
             # Train on any final short batch so the declared token budget is exact.
             if buffers[layer].numel():
@@ -180,6 +275,10 @@ def run_routerinterp_streaming_sae_fit_pipeline(config: dict[str, Any]) -> dict[
             layer_dir = output_dir / f"layer_{layer:02d}"
             layer_dir.mkdir(parents=True, exist_ok=True)
             sae.eval().save_pretrained(str(layer_dir / "topk_sae.pt"))
+            if itda_enabled:
+                if layer not in itdas:
+                    raise ValueError(f"ITDA did not receive any sampled router activations at layer {layer}.")
+                itdas[layer].eval().save_pretrained(str(layer_dir / "itda.pt"))
             gate_weight = model_layers[layer].mlp.gate.weight.detach().cpu().float()
             if gate_weight.ndim != 2 or gate_weight.shape[1] != sae.config.d_model:
                 raise ValueError(f"Layer {layer} gate weights are incompatible with its SAE input width.")
@@ -193,6 +292,16 @@ def run_routerinterp_streaming_sae_fit_pipeline(config: dict[str, Any]) -> dict[
             "source_paths": [str(path) for path in paths],
             "dataset_config_path": config.get("dataset_config_path"),
             "final_loss": {str(layer): values[-1] for layer, values in losses.items() if values},
+            "itda": {
+                "enabled": itda_enabled,
+                "sampled_tokens_per_layer": itda_sampled_tokens if itda_enabled else 0,
+                "source_stride": itda_stride if itda_enabled else None,
+                "source_order_sampling": "global token index modulo source_stride" if itda_enabled else None,
+                "config": itda_settings if itda_enabled else None,
+                "final_update": {
+                    str(layer): values[-1] for layer, values in itda_history.items() if values
+                },
+            },
             "cache_dir": str(cache_dir),
         }
         write_json(output_dir / "sae_fit_manifest.json", manifest)
@@ -296,7 +405,18 @@ def _load_layer_tokens(
     *,
     layer: int,
     max_tokens: int | None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[str], int, int]:
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    list[str],
+    list[str],
+    list[str],
+    int,
+    int,
+]:
     """Read an explicit token cap from per-prompt artifacts in manifest order."""
 
     manifest = json.loads((artifact_dir / "manifest.json").read_text(encoding="utf-8"))
@@ -306,6 +426,8 @@ def _load_layer_tokens(
     token_ids: list[torch.Tensor] = []
     previous_token_ids: list[torch.Tensor] = []
     domains: list[str] = []
+    languages: list[str] = []
+    datasets: list[str] = []
     retained = 0
     num_experts: int | None = None
     for row in manifest["prompts"]:
@@ -316,13 +438,19 @@ def _load_layer_tokens(
             raise KeyError(f"Layer {layer} is absent from {artifact_dir / row['path']}") from exc
         x = block["router_input"].float()
         y = block["selected_experts"].long()
-        probabilities = block["router_probabilities"]
+        probabilities = block["router_probabilities"].float()
         positions = payload["positions"].long()
         full_token_ids = payload["token_ids"].long()
         if x.ndim != 2 or y.ndim != 2 or x.shape[0] != y.shape[0]:
             raise ValueError(f"Malformed RouterInterp artifact {artifact_dir / row['path']}.")
         if probabilities.ndim != 2 or probabilities.shape[0] != x.shape[0]:
             raise ValueError(f"Malformed router probabilities in {artifact_dir / row['path']}.")
+        _require_finite_tensor(f"router inputs in {row['path']}", x)
+        _require_probability_matrix(f"router probabilities in {row['path']}", probabilities)
+        if y.shape[1] < 1 or (y < 0).any() or (y >= probabilities.shape[1]).any():
+            raise ValueError(f"Malformed selected expert ids in {artifact_dir / row['path']}.")
+        if (y.sort(dim=1).values[:, 1:] == y.sort(dim=1).values[:, :-1]).any():
+            raise ValueError(f"Duplicate selected experts in {artifact_dir / row['path']}.")
         if positions.ndim != 1 or positions.shape[0] != x.shape[0]:
             raise ValueError(f"Malformed token positions in {artifact_dir / row['path']}.")
         if full_token_ids.ndim != 1 or positions.max().item() >= full_token_ids.shape[0]:
@@ -341,10 +469,22 @@ def _load_layer_tokens(
             source_ids, previous_ids = source_ids[:remaining], previous_ids[:remaining]
         activations.append(x)
         selected.append(y)
-        router_probabilities.append(probabilities.float())
+        router_probabilities.append(probabilities)
         token_ids.append(source_ids)
         previous_token_ids.append(previous_ids)
-        domains.extend([str(payload.get("domain", "unknown"))] * x.shape[0])
+        metadata = {
+            key: str(payload.get(key, "")).strip()
+            for key in ("domain", "language", "dataset_name")
+        }
+        missing = [key for key, value in metadata.items() if not value or value.lower() == "unknown"]
+        if missing:
+            raise ValueError(
+                f"RouterInterp artifact {artifact_dir / row['path']} is missing required metadata: "
+                + ", ".join(missing)
+            )
+        domains.extend([metadata["domain"]] * x.shape[0])
+        languages.extend([metadata["language"]] * x.shape[0])
+        datasets.extend([metadata["dataset_name"]] * x.shape[0])
         retained += x.shape[0]
     if not activations:
         raise ValueError(f"No tokens available for layer {layer} in {artifact_dir}.")
@@ -356,6 +496,8 @@ def _load_layer_tokens(
         torch.cat(token_ids),
         torch.cat(previous_token_ids),
         domains,
+        languages,
+        datasets,
         retained,
         num_experts,
     )
@@ -422,11 +564,18 @@ def _top_rho_feature_contexts(
 
     if features.shape[0] != prompt_rows.numel() or features.shape[0] != token_positions.numel():
         raise ValueError("Feature activations and token provenance are not aligned.")
+    if max_contexts_per_feature < 1:
+        raise ValueError("max_contexts_per_feature must be positive.")
+    _require_finite_tensor("feature-context activations", features)
+    _require_finite_tensor("rho values", rho_values)
     rows: list[dict[str, Any]] = []
     for expert in range(rho_indices.shape[0]):
         for rank, feature_id_tensor in enumerate(rho_indices[expert]):
             feature_id = int(feature_id_tensor.item())
-            activations = features[:, feature_id]
+            # ITDA coefficients can be signed. Domain concentration concerns
+            # feature use, so measure activation magnitude for both methods.
+            signed_activations = features[:, feature_id]
+            activations = signed_activations.abs()
             count = min(max_contexts_per_feature, activations.numel())
             values, indices = activations.topk(k=count)
             for context_rank, (value, token_row) in enumerate(zip(values.tolist(), indices.tolist()), start=1):
@@ -441,7 +590,8 @@ def _top_rho_feature_contexts(
                         "rho_rank": rank + 1,
                         "rho": float(rho_values[expert, rank].item()),
                         "context_rank": context_rank,
-                        "activation": float(value),
+                        "activation": float(signed_activations[token_row].item()),
+                        "activation_magnitude": float(value),
                         "example_id": prompt["example_id"],
                         "dataset_name": prompt["dataset_name"],
                         "task": prompt["task"],
@@ -470,12 +620,16 @@ def _top_rho_feature_domain_profiles(
 
     if features.shape[0] != len(domains):
         raise ValueError("Feature activations and domain labels are not aligned.")
+    _require_finite_tensor("feature-domain activations", features)
+    _require_finite_tensor("feature-domain rho values", rho_values)
     domain_names = sorted(set(domains))
     rows: list[dict[str, Any]] = []
     for expert in range(rho_indices.shape[0]):
         for rank, feature_id_tensor in enumerate(rho_indices[expert]):
             feature_id = int(feature_id_tensor.item())
-            activations = features[:, feature_id]
+            # ITDA matching-pursuit coefficients can be negative; distribution
+            # summaries therefore use the magnitude of feature use.
+            activations = features[:, feature_id].abs()
             masses = []
             means: dict[str, float] = {}
             for domain in domain_names:
@@ -485,6 +639,9 @@ def _top_rho_feature_domain_profiles(
                 means[domain] = float(domain_activations.mean().item()) if domain_activations.numel() else 0.0
             mass_tensor = torch.stack(masses)
             shares = mass_tensor / mass_tensor.sum().clamp_min(1e-8)
+            _require_finite_tensor("feature-domain activation shares", shares)
+            if (shares < -1e-8).any() or (shares > 1.0 + 1e-8).any():
+                raise ValueError("Feature-domain activation shares are outside [0, 1].")
             positive = shares[shares > 0]
             entropy = (
                 float((-(positive * positive.log()).sum() / math.log(len(domain_names))).item())
@@ -500,7 +657,7 @@ def _top_rho_feature_domain_profiles(
                         "rho_rank": rank + 1,
                         "rho": float(rho_values[expert, rank].item()),
                         "domain": domain,
-                        "mean_activation": means[domain],
+                        "mean_activation_magnitude": means[domain],
                         "activation_mass_share": float(shares[domain_index].item()),
                         "normalized_domain_entropy": entropy,
                     }
@@ -612,12 +769,69 @@ def _domain_routing_summary(
                 "domain_routing_share": {name: float(probabilities[index[name]].item()) for name in names},
             }
         )
-    return {
+    result = {
         "domains": names,
         "corpus_normalized_entropy": normalized_entropy(corpus_distribution),
         "corpus_domain_share": {name: float(corpus_distribution[index[name]].item()) for name in names},
         "per_expert": per_expert,
     }
+    _require_json_finite(result, path="domain_routing")
+    return result
+
+
+def _expert_activation_by_group(
+    selected_experts: torch.Tensor,
+    groups: list[str],
+    *,
+    num_experts: int,
+) -> dict[str, Any]:
+    """Report actual router selection rates conditional on a provenance group.
+
+    This is intentionally the reverse conditional of ``_domain_routing_summary``:
+    it answers ``P(expert active | Danish news)`` rather than merely describing
+    which domains are present among tokens already routed to one expert.
+    """
+
+    targets = selected_expert_targets(selected_experts, num_experts)
+    return _expert_activation_targets_by_group(targets, groups)
+
+
+def _expert_activation_targets_by_group(
+    targets: torch.Tensor,
+    groups: list[str],
+) -> dict[str, Any]:
+    """Summarise binary expert activations conditional on provenance groups."""
+
+    if targets.ndim != 2 or targets.shape[0] < 1:
+        raise ValueError("Grouped expert activations must be a non-empty (token, expert) matrix.")
+    if len(groups) != targets.shape[0]:
+        raise ValueError("Each expert-activation target must retain one group label.")
+    _require_finite_tensor("group expert activation targets", targets)
+    if (targets < 0).any() or (targets > 1).any():
+        raise ValueError("Grouped expert activations must be in [0, 1].")
+    corpus_rates = targets.mean(dim=0)
+    rows: list[dict[str, Any]] = []
+    for group in sorted(set(groups)):
+        mask = torch.tensor([value == group for value in groups], dtype=torch.bool)
+        group_targets = targets[mask]
+        rates = group_targets.mean(dim=0)
+        _require_finite_tensor("group expert activation rates", rates)
+        if (rates < 0).any() or (rates > 1).any():
+            raise ValueError("Group expert activation rates are outside [0, 1].")
+        rows.append(
+            {
+                "group": group,
+                "token_count": int(mask.sum().item()),
+                "expert_activation_rate": rates.tolist(),
+                "expert_enrichment_vs_corpus": (rates / corpus_rates.clamp_min(1e-8)).tolist(),
+            }
+        )
+    result = {
+        "corpus_expert_activation_rate": corpus_rates.tolist(),
+        "groups": rows,
+    }
+    _require_json_finite(result, path="expert_activation_by_group")
+    return result
 
 
 def _constant_top_k(selected_experts: torch.Tensor, split_name: str) -> int:
@@ -664,7 +878,13 @@ def _expected_calibration_error(probabilities: torch.Tensor, targets: torch.Tens
 
     if probabilities.shape != targets.shape:
         raise ValueError("Calibration probabilities and targets must have the same shape.")
-    confidence = probabilities.flatten().clamp(0, 1)
+    if bins < 2:
+        raise ValueError("ECE requires at least two bins.")
+    _require_finite_tensor("calibration probabilities", probabilities)
+    _require_finite_tensor("calibration targets", targets)
+    if (probabilities < 0).any() or (probabilities > 1).any() or (targets < 0).any() or (targets > 1).any():
+        raise ValueError("Calibration probabilities and targets must be in [0, 1].")
+    confidence = probabilities.flatten()
     outcome = targets.flatten().float()
     boundaries = torch.linspace(0, 1, bins + 1, device=confidence.device)
     error = torch.zeros((), device=confidence.device)
@@ -675,7 +895,7 @@ def _expected_calibration_error(probabilities: torch.Tensor, targets: torch.Tens
         )
         if membership.any():
             error += membership.float().mean() * (confidence[membership].mean() - outcome[membership].mean()).abs()
-    return float(error.item())
+    return _checked_metric("selection_ece", float(error.item()), lower=0.0, upper=1.0)
 
 
 def _router_distribution_metrics(scores: torch.Tensor, actual_probabilities: torch.Tensor) -> dict[str, float]:
@@ -683,6 +903,8 @@ def _router_distribution_metrics(scores: torch.Tensor, actual_probabilities: tor
 
     if scores.shape != actual_probabilities.shape:
         raise ValueError("Router scores and captured probabilities must have the same shape.")
+    _require_finite_tensor("routing prediction scores", scores)
+    _require_probability_matrix("captured router probabilities", actual_probabilities)
     if (scores >= 0).all():
         predicted = scores / scores.sum(-1, keepdim=True).clamp_min(1e-8)
     else:
@@ -698,10 +920,60 @@ def _router_distribution_metrics(scores: torch.Tensor, actual_probabilities: tor
     ).mean()
     tv = 0.5 * (actual - predicted).abs().sum(-1).mean()
     return {
-        "kl_actual_to_predicted": float(kl_actual_predicted.item()),
-        "jensen_shannon_divergence": float(jsd.item()),
-        "total_variation_distance": float(tv.item()),
+        "kl_actual_to_predicted": _checked_metric("kl_actual_to_predicted", float(kl_actual_predicted.item()), lower=0.0),
+        "jensen_shannon_divergence": _checked_metric(
+            "jensen_shannon_divergence", float(jsd.item()), lower=0.0, upper=float(torch.log(torch.tensor(2.0)).item())
+        ),
+        "total_variation_distance": _checked_metric("total_variation_distance", float(tv.item()), lower=0.0, upper=1.0),
     }
+
+
+def _router_probability_distribution_summary(
+    probabilities: torch.Tensor,
+    *,
+    bins: int = 24,
+) -> dict[str, object]:
+    """Compact, finite histogram summaries for appendix distribution figures."""
+
+    if bins < 2:
+        raise ValueError("Router distribution summaries require at least two bins.")
+    _require_probability_matrix("captured router probabilities", probabilities)
+    normalized = probabilities / probabilities.sum(-1, keepdim=True).clamp_min(1e-8)
+    top_two = normalized.topk(k=min(2, normalized.shape[-1]), dim=-1).values
+    top_one = top_two[:, 0]
+    margin = top_one - top_two[:, 1] if normalized.shape[-1] > 1 else torch.zeros_like(top_one)
+    entropy = -(normalized.clamp_min(1e-8) * normalized.clamp_min(1e-8).log()).sum(-1)
+    entropy = entropy / math.log(normalized.shape[-1]) if normalized.shape[-1] > 1 else torch.zeros_like(entropy)
+
+    def summarize(values: torch.Tensor, name: str) -> dict[str, object]:
+        _require_finite_tensor(name, values)
+        if (values < 0).any() or (values > 1).any():
+            raise ValueError(f"{name} must be in [0, 1].")
+        counts = torch.histc(values, bins=bins, min=0.0, max=1.0).to(torch.int64)
+        edges = torch.linspace(0.0, 1.0, bins + 1)
+        result = {
+            "mean": float(values.mean().item()),
+            "std": float(values.std(unbiased=False).item()),
+            "quantiles": {
+                "p05": float(torch.quantile(values, 0.05).item()),
+                "p25": float(torch.quantile(values, 0.25).item()),
+                "p50": float(torch.quantile(values, 0.50).item()),
+                "p75": float(torch.quantile(values, 0.75).item()),
+                "p95": float(torch.quantile(values, 0.95).item()),
+            },
+            "histogram": {"edges": edges.tolist(), "counts": counts.tolist()},
+        }
+        _require_json_finite(result, path=f"router_probability_distribution.{name}")
+        return result
+
+    result = {
+        "token_count": int(normalized.shape[0]),
+        "top1_weight": summarize(top_one, "top1_weight"),
+        "top1_top2_margin": summarize(margin, "top1_top2_margin"),
+        "normalized_entropy": summarize(entropy, "normalized_entropy"),
+    }
+    _require_json_finite(result, path="router_probability_distribution")
+    return result
 
 
 def _routing_prediction_metrics(
@@ -720,15 +992,17 @@ def _routing_prediction_metrics(
     predicted_count = predicted.sum(-1).clamp_min(1)
     actual_count = targets.sum(-1).clamp_min(1)
     result = {
-        "set_precision_at_k": float((intersection / predicted_count).mean().item()),
-        "set_recall_at_k": float((intersection / actual_count).mean().item()),
-        "set_jaccard_at_k": float((intersection / union).mean().item()),
+        "set_precision_at_k": _checked_metric("set_precision_at_k", float((intersection / predicted_count).mean().item()), lower=0.0, upper=1.0),
+        "set_recall_at_k": _checked_metric("set_recall_at_k", float((intersection / actual_count).mean().item()), lower=0.0, upper=1.0),
+        "set_jaccard_at_k": _checked_metric("set_jaccard_at_k", float((intersection / union).mean().item()), lower=0.0, upper=1.0),
         "macro_f1": macro_f1_expert_routing(predicted, targets),
         **_router_distribution_metrics(scores, actual_probabilities),
     }
     if include_binary_calibration:
         selection_probabilities = torch.sigmoid(scores)
-        result["selection_brier_score"] = float(((selection_probabilities - targets.float()) ** 2).mean().item())
+        result["selection_brier_score"] = _checked_metric(
+            "selection_brier_score", float(((selection_probabilities - targets.float()) ** 2).mean().item()), lower=0.0, upper=1.0
+        )
         result["selection_ece"] = _expected_calibration_error(selection_probabilities, targets)
     return result
 
@@ -853,6 +1127,19 @@ def run_routerinterp_analysis_pipeline(config: dict[str, Any]) -> dict[str, Any]
             fit_manifest.get("trained_tokens_per_layer", 0)
         ) < required_tokens:
             raise ValueError("The streamed SAE checkpoint does not meet the configured SAE token budget.")
+    itda_requested = bool(dict(config.get("itda", {})).get("enabled", False))
+    if itda_requested and not pretrained_sae_dir:
+        raise ValueError("ITDA analysis requires a streamed dictionary checkpoint directory.")
+    if itda_requested and not bool(fit_manifest.get("itda", {}).get("enabled", False)):
+        raise ValueError("ITDA was requested for analysis but is absent from the streamed fitting manifest.")
+    if itda_requested:
+        requested_itda_tokens = int(dict(config.get("itda", {})).get("fit_tokens", 1_000_000))
+        fitted_itda_tokens = int(fit_manifest.get("itda", {}).get("sampled_tokens_per_layer", 0))
+        if fitted_itda_tokens != requested_itda_tokens:
+            raise ValueError(
+                f"ITDA analysis requires exactly {requested_itda_tokens:,} fitted tokens; "
+                f"the streamed dictionary reports {fitted_itda_tokens:,}."
+            )
     output_dir = _project_tmp_path(
         project_root,
         str(config.get("output_path", "tmp/routerinterp/analysis")),
@@ -886,6 +1173,8 @@ def run_routerinterp_analysis_pipeline(config: dict[str, Any]) -> dict[str, Any]
             train_token_ids,
             train_previous_token_ids,
             _train_domains,
+            _train_languages,
+            _train_datasets,
             train_token_count,
             train_num_experts,
         ) = _load_layer_tokens(
@@ -900,11 +1189,19 @@ def run_routerinterp_analysis_pipeline(config: dict[str, Any]) -> dict[str, Any]
             eval_token_ids,
             eval_previous_token_ids,
             eval_domains,
+            eval_languages,
+            eval_datasets,
             eval_token_count,
             eval_num_experts,
         ) = _load_layer_tokens(
             eval_dir, layer=layer, max_tokens=None if max_eval_tokens is None else int(max_eval_tokens)
         )
+        eval_prompt_records, eval_prompt_rows, eval_token_positions = _load_token_provenance(
+            eval_dir,
+            max_tokens=None if max_eval_tokens is None else int(max_eval_tokens),
+        )
+        if eval_prompt_rows.numel() != eval_x.shape[0]:
+            raise ValueError("Held-out provenance rows do not align with router activations.")
         if train_x.shape[1] != eval_x.shape[1]:
             raise ValueError(f"Layer {layer} has inconsistent router-input widths across splits.")
         train_top_k = _constant_top_k(train_selected, "Train")
@@ -985,6 +1282,32 @@ def run_routerinterp_analysis_pipeline(config: dict[str, Any]) -> dict[str, Any]
             eval_reconstruction, eval_features = sae(eval_x)
             train_mse = float(torch.nn.functional.mse_loss(train_reconstruction, train_x).item())
             eval_mse = float(torch.nn.functional.mse_loss(eval_reconstruction, eval_x).item())
+        _checked_metric("Top-K SAE train reconstruction MSE", train_mse, lower=0.0)
+        _checked_metric("Top-K SAE held-out reconstruction MSE", eval_mse, lower=0.0)
+        _require_finite_tensor("Top-K SAE train features", train_features)
+        _require_finite_tensor("Top-K SAE held-out features", eval_features)
+
+        itda = None
+        itda_train_features = None
+        itda_eval_features = None
+        itda_train_mse = None
+        itda_eval_mse = None
+        if itda_requested:
+            itda_path = pretrained_root / f"layer_{layer:02d}" / "itda.pt"
+            if not itda_path.is_file():
+                raise FileNotFoundError(f"Missing ITDA checkpoint for layer {layer}: {itda_path}")
+            itda = ITDA.from_pretrained(itda_path).to(device)
+            if itda.config.d_model != train_x.shape[1]:
+                raise ValueError(f"ITDA dictionary width does not match layer {layer} router inputs.")
+            with torch.no_grad():
+                itda_train_features = itda.encode(train_x)
+                itda_eval_features = itda.encode(eval_x)
+                itda_train_mse = float(torch.nn.functional.mse_loss(itda.decode(itda_train_features), train_x).item())
+                itda_eval_mse = float(torch.nn.functional.mse_loss(itda.decode(itda_eval_features), eval_x).item())
+            _checked_metric("ITDA train reconstruction MSE", itda_train_mse, lower=0.0)
+            _checked_metric("ITDA held-out reconstruction MSE", itda_eval_mse, lower=0.0)
+            _require_finite_tensor("ITDA train features", itda_train_features)
+            _require_finite_tensor("ITDA held-out features", itda_eval_features)
         probe_train_features = train_features[:probe_fit_tokens].detach()
         probe_train_targets = train_targets[:probe_fit_tokens]
         probe_train_token_ids = train_token_ids[:probe_fit_tokens]
@@ -1038,6 +1361,7 @@ def run_routerinterp_analysis_pipeline(config: dict[str, Any]) -> dict[str, Any]
         if primary_active_features not in active_feature_counts:
             raise ValueError("primary_active_features must be included in active_feature_counts.")
         sae_by_active_features: dict[str, dict[str, float]] = {}
+        itda_by_active_features: dict[str, dict[str, float]] = {}
         neuron_by_active_features: dict[str, dict[str, float]] = {}
         pca_by_active_features: dict[str, dict[str, float]] = {}
         primary_sae_probe = None
@@ -1056,6 +1380,25 @@ def run_routerinterp_analysis_pipeline(config: dict[str, Any]) -> dict[str, Any]
             )
             if active_features == primary_active_features:
                 primary_sae_probe = probe
+
+            if itda is not None and itda_train_features is not None and itda_eval_features is not None:
+                if active_features > itda.n_atoms:
+                    raise ValueError(
+                        f"ITDA layer {layer} has {itda.n_atoms} atoms but comparison requests {active_features}."
+                    )
+                sparse_itda_train = sparse_by_magnitude(
+                    itda_train_features[:probe_fit_tokens], k=active_features
+                )
+                sparse_itda_eval = sparse_by_magnitude(itda_eval_features, k=active_features)
+                itda_probe = fit_routing_probe(
+                    sparse_itda_train,
+                    probe_train_targets,
+                    steps=int(probe_settings.get("steps", 500)),
+                    learning_rate=float(probe_settings.get("learning_rate", 1e-3)),
+                )
+                itda_by_active_features[str(active_features)] = _probe_metrics(
+                    itda_probe, sparse_itda_eval, eval_targets, eval_router_probabilities, top_k=eval_top_k
+                )
 
             # These are additional controls, not claimed RouterInterp baselines:
             # both retain exactly the same m coordinates as the SAE representation.
@@ -1085,9 +1428,95 @@ def run_routerinterp_analysis_pipeline(config: dict[str, Any]) -> dict[str, Any]
         assert primary_sae_probe is not None
         coactivation = feature_coactivation_ratio(eval_features, rho_indices)
         activation_diagnostics = feature_activation_diagnostics(eval_features)
+        top_rho_contexts = _top_rho_feature_contexts(
+            features=eval_features.cpu(),
+            rho_indices=rho_indices.cpu(),
+            rho_values=rho_values.cpu(),
+            expert_labels=expert_labels,
+            prompt_records=eval_prompt_records,
+            prompt_rows=eval_prompt_rows,
+            token_positions=eval_token_positions,
+            max_contexts_per_feature=int(config.get("max_contexts_per_feature", 10)),
+        )
+        top_rho_domain_profiles = _top_rho_feature_domain_profiles(
+            features=eval_features.cpu(),
+            domains=eval_domains,
+            rho_indices=rho_indices.cpu(),
+            rho_values=rho_values.cpu(),
+            expert_labels=expert_labels,
+        )
+        itda_analysis = None
+        if itda is not None and itda_train_features is not None and itda_eval_features is not None:
+            itda_rho = rho_usefulness(itda_train_features[:probe_fit_tokens].detach(), probe_train_targets)
+            itda_rho_indices, itda_rho_values = top_rho_features(itda_rho, n_features=top_rho_count)
+            itda_analysis = {
+                "config": asdict(itda.config),
+                "atom_count": itda.n_atoms,
+                "atom_provenance_checkpoint": str(itda_path),
+                "train_reconstruction_mse": itda_train_mse,
+                "heldout_reconstruction_mse": itda_eval_mse,
+                "feature_coactivation": feature_coactivation_ratio(itda_eval_features, itda_rho_indices),
+                "feature_activation_diagnostics": feature_activation_diagnostics(itda_eval_features),
+                "top_rho_features": [
+                    {
+                        "expert": expert,
+                        "expert_label": expert_labels[expert] if expert_labels else f"expert_{expert}",
+                        "feature_ids": itda_rho_indices[expert].cpu().tolist(),
+                        "rho": itda_rho_values[expert].cpu().tolist(),
+                    }
+                    for expert in range(n_experts)
+                ],
+                "top_rho_contexts": _top_rho_feature_contexts(
+                    features=itda_eval_features.cpu(),
+                    rho_indices=itda_rho_indices.cpu(),
+                    rho_values=itda_rho_values.cpu(),
+                    expert_labels=expert_labels,
+                    prompt_records=eval_prompt_records,
+                    prompt_rows=eval_prompt_rows,
+                    token_positions=eval_token_positions,
+                    max_contexts_per_feature=int(config.get("max_contexts_per_feature", 10)),
+                ),
+                "top_rho_domain_profiles": _top_rho_feature_domain_profiles(
+                    features=itda_eval_features.cpu(),
+                    domains=eval_domains,
+                    rho_indices=itda_rho_indices.cpu(),
+                    rho_values=itda_rho_values.cpu(),
+                    expert_labels=expert_labels,
+                ),
+            }
         domain_routing = _domain_routing_summary(
             eval_selected,
             eval_domains,
+            num_experts=n_experts,
+        )
+        actual_domain_expert_activation = _expert_activation_by_group(
+            eval_selected,
+            eval_domains,
+            num_experts=n_experts,
+        )
+        with torch.no_grad():
+            primary_sae_eval = sparse_by_magnitude(eval_features, k=primary_active_features)
+            sae_predicted_targets = top_k_expert_predictions(
+                primary_sae_probe(primary_sae_eval),
+                top_k=eval_top_k,
+            ).cpu()
+        sae_predicted_domain_expert_activation = _expert_activation_targets_by_group(
+            sae_predicted_targets,
+            eval_domains,
+        )
+        language_routing = _expert_activation_by_group(
+            eval_selected,
+            eval_languages,
+            num_experts=n_experts,
+        )
+        language_domain_routing = _expert_activation_by_group(
+            eval_selected,
+            [f"{language}:{domain}" for language, domain in zip(eval_languages, eval_domains)],
+            num_experts=n_experts,
+        )
+        dataset_routing = _expert_activation_by_group(
+            eval_selected,
+            eval_datasets,
             num_experts=n_experts,
         )
         geometry_path = pretrained_root / f"layer_{layer:02d}" / "router_geometry.pt" if pretrained_sae_dir else None
@@ -1116,6 +1545,13 @@ def run_routerinterp_analysis_pipeline(config: dict[str, Any]) -> dict[str, Any]
             },
             layer_dir / "routing_analysis.pt",
         )
+        _require_json_finite(top_rho_contexts, path=f"layer_{layer}.topk_sae_contexts")
+        _require_json_finite(top_rho_domain_profiles, path=f"layer_{layer}.topk_sae_domain_profiles")
+        write_json(layer_dir / "topk_sae_top_rho_contexts.json", top_rho_contexts)
+        write_json(layer_dir / "topk_sae_top_rho_domain_profiles.json", top_rho_domain_profiles)
+        if itda_analysis is not None:
+            _require_json_finite(itda_analysis, path=f"layer_{layer}.itda")
+            write_json(layer_dir / "itda_analysis.json", itda_analysis)
         layer_result = {
             "sae_config": asdict(sae_config),
             "protocol": protocol,
@@ -1136,11 +1572,14 @@ def run_routerinterp_analysis_pipeline(config: dict[str, Any]) -> dict[str, Any]
             "pca_fit_tokens": probe_fit_tokens,
             "train_reconstruction_mse": train_mse,
             "heldout_reconstruction_mse": eval_mse,
+            "itda": itda_analysis,
             "routing_prediction": {
                 "unigram_baseline": unigram_metrics,
                 "bigram_baseline": bigram_metrics,
                 "sae_predictor": sae_by_active_features[str(primary_active_features)],
                 "sae_predictor_by_active_features": sae_by_active_features,
+                "itda_predictor": itda_by_active_features.get(str(primary_active_features)),
+                "itda_predictor_by_active_features": itda_by_active_features,
                 "neuron_basis_probe": neuron_by_active_features[str(primary_active_features)],
                 "neuron_basis_probe_by_active_features": neuron_by_active_features,
                 "pca_basis_probe": pca_by_active_features[str(primary_active_features)],
@@ -1149,7 +1588,15 @@ def run_routerinterp_analysis_pipeline(config: dict[str, Any]) -> dict[str, Any]
             "final_train_loss": loss_history[-1] if loss_history else None,
             "feature_coactivation": coactivation,
             "feature_activation_diagnostics": activation_diagnostics,
+            "router_probability_distribution": _router_probability_distribution_summary(
+                eval_router_probabilities.cpu()
+            ),
             "domain_routing": domain_routing,
+            "domain_expert_activation": actual_domain_expert_activation,
+            "sae_predicted_domain_expert_activation": sae_predicted_domain_expert_activation,
+            "language_routing": language_routing,
+            "language_domain_routing": language_domain_routing,
+            "dataset_routing": dataset_routing,
             "rho_router_geometry_agreement": router_geometry,
             "top_rho_features": [
                 {
@@ -1161,8 +1608,11 @@ def run_routerinterp_analysis_pipeline(config: dict[str, Any]) -> dict[str, Any]
                 }
                 for expert in range(n_experts)
             ],
+            "top_rho_context_artifact": str(layer_dir / "topk_sae_top_rho_contexts.json"),
+            "top_rho_domain_profile_artifact": str(layer_dir / "topk_sae_top_rho_domain_profiles.json"),
             "artifact_dir": str(layer_dir),
         }
+        _require_json_finite(layer_result, path=f"layer_{layer}")
         write_json(layer_dir / "summary.json", layer_result)
         results["layers"][str(layer)] = layer_result
         del train_x, eval_x, train_features, eval_features, sae, primary_sae_probe
@@ -1171,5 +1621,6 @@ def run_routerinterp_analysis_pipeline(config: dict[str, Any]) -> dict[str, Any]
 
     results["train_artifacts_path"] = str(train_dir)
     results["eval_artifacts_path"] = str(eval_dir)
+    _require_json_finite(results, path="routerinterp_summary")
     write_json(output_dir / "summary.json", results)
     return {"output_dir": str(output_dir), "summary_path": str(output_dir / "summary.json"), **results}

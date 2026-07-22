@@ -20,12 +20,13 @@ from mi_lens.plotting.plotly_export import save_plotly_figure
 
 
 LAYERS = [5, 11, 18, 24, 31]
-METHODS = ["Unigram", "Bigram", "Neuron", "PCA", "SAE"]
+METHODS = ["Unigram", "Bigram", "Neuron", "PCA", "ITDA", "SAE"]
 METHOD_COLORS = {
     "Unigram": "#90A9B5",
     "Bigram": "#64818F",
     "Neuron": "#3E6E7C",
     "PCA": "#287F8C",
+    "ITDA": "#4B7586",
     "SAE": "#063F59",
 }
 LAYER_COLORS = ["#D4E8EB", "#9CCAD0", "#5CA7B1", "#277987", "#063F59"]
@@ -66,47 +67,59 @@ def _style(
     title: str | None,
     *,
     height: int = 820,
-    legend_below: bool = False,
     has_subplots: bool = False,
 ) -> None:
-    legend_layout = (
-        dict(orientation="h", yanchor="bottom", y=1.005, xanchor="center", x=0.5)
-        if legend_below
-        else dict(orientation="h", yanchor="bottom", y=1.005, xanchor="center", x=0.5)
+    show_legend = any(trace.showlegend is not False and bool(trace.name) for trace in figure.data)
+    legend_layout = dict(
+        orientation="h", yanchor="bottom", yref="container", y=0.89, xanchor="center", x=0.5
     )
     figure.update_layout(
         template="plotly_white",
         title=(
             dict(
-                text=f"<b>{title}</b>", x=0.02, xanchor="left", y=0.985,
-                font=dict(size=17, color=INK),
+                text=f"<b>{title}</b>", x=0.02, xanchor="left", y=0.99,
+                font=dict(size=19, color=INK, family="Arial, sans-serif"),
             )
             if title
             else None
         ),
-        font=dict(family="Arial, sans-serif", size=16, color=INK),
+        # The PDF is placed at 0.96\textwidth: this compact hierarchy remains
+        # readable after LaTeX scaling without overpowering the data.
+        font=dict(family="Arial, sans-serif", size=18, color=INK),
         paper_bgcolor=PAPER_BG,
         plot_bgcolor=PAPER_BG,
-        width=1180,
+        width=1280,
         height=height,
-        margin=dict(l=96, r=86, t=104 if has_subplots else 66, b=58),
+        margin=dict(l=78, r=94, t=(48 if show_legend else 40), b=44),
         legend=dict(
             **legend_layout,
-            font=dict(size=16, family="Arial, sans-serif"), bgcolor="rgba(0,0,0,0)",
+            visible=show_legend,
+            font=dict(size=16, family="Arial, sans-serif", weight=600), bgcolor="rgba(0,0,0,0)",
         ),
     )
     figure.update_xaxes(
         showline=True, linecolor="#8BA4AA", gridcolor=GRID, zeroline=False,
-        title_font=dict(size=18, family="Arial, sans-serif"),
-        tickfont=dict(size=16, family="Arial, sans-serif"), title_standoff=7,
+        title_font=dict(size=17, family="Arial, sans-serif", weight=600),
+        tickfont=dict(size=15, family="Arial, sans-serif", weight=600), title_standoff=8,
     )
     figure.update_yaxes(
         showline=True, linecolor="#8BA4AA", gridcolor=GRID, zeroline=False,
-        title_font=dict(size=18, family="Arial, sans-serif"),
-        tickfont=dict(size=16, family="Arial, sans-serif"), title_standoff=7,
+        title_font=dict(size=17, family="Arial, sans-serif", weight=600),
+        tickfont=dict(size=15, family="Arial, sans-serif", weight=600), title_standoff=8,
     )
+    if title:
+        # Scale each existing subplot domain into the plot band. This reserves
+        # a small title band even when a figure has no legend.
+        plot_top = 0.93 if show_legend else 0.94
+        for axis in figure.select_yaxes():
+            if axis.domain is not None:
+                axis.domain = [float(bound) * plot_top for bound in axis.domain]
     for annotation in figure.layout.annotations or ():
-        annotation.update(font=dict(size=16, family="Arial, sans-serif", color=INK))
+        if has_subplots and title:
+            plot_top = 0.93 if show_legend else 0.94
+            # Keep enlarged subplot titles below the main-title band.
+            annotation.y = float(annotation.y) * plot_top - 0.01
+        annotation.update(font=dict(size=18, family="Arial, sans-serif", weight=600, color=INK))
 
 
 def _write(figure: go.Figure, output_dir: Path, stem: str) -> list[str]:
@@ -119,7 +132,14 @@ def _write(figure: go.Figure, output_dir: Path, stem: str) -> list[str]:
 
 def _predictor_mockup(output_dir: Path) -> list[str]:
     figure = go.Figure()
-    bases = {"Unigram": 0.42, "Bigram": 0.48, "Neuron": 0.54, "PCA": 0.57, "SAE": 0.66}
+    bases = {
+        "Unigram": 0.42,
+        "Bigram": 0.48,
+        "Neuron": 0.54,
+        "PCA": 0.57,
+        "ITDA": 0.61,
+        "SAE": 0.66,
+    }
     for method_index, method in enumerate(METHODS):
         values = [bases[method] + 0.03 + 0.008 * index + 0.007 * ((method_index + index) % 2) for index in range(5)]
         figure.add_trace(
@@ -128,7 +148,7 @@ def _predictor_mockup(output_dir: Path) -> list[str]:
                 y=values,
                 mode="lines+markers",
                 name=method,
-                line=dict(color=METHOD_COLORS[method], width=3.2 if method == "SAE" else 2.1),
+                line=dict(color=METHOD_COLORS[method], width=3.2 if method == "SAE" else 2.5 if method == "ITDA" else 2.1),
                 marker=dict(size=8),
             )
         )
@@ -137,7 +157,19 @@ def _predictor_mockup(output_dir: Path) -> list[str]:
     _style(
         figure,
         "Router prediction baselines: FlexDanish-8x7B-1T-a4-55B-v2",
-        height=650,
+        height=600,
+    )
+    figure.update_layout(
+        title_font=dict(size=20, family="Arial, sans-serif", weight=600),
+        legend=dict(font=dict(size=18, family="Arial, sans-serif", weight=600)),
+    )
+    figure.update_xaxes(
+        title_font=dict(size=19, family="Arial, sans-serif", weight=600),
+        tickfont=dict(size=17, family="Arial, sans-serif", weight=600),
+    )
+    figure.update_yaxes(
+        title_font=dict(size=19, family="Arial, sans-serif", weight=600),
+        tickfont=dict(size=17, family="Arial, sans-serif", weight=600),
     )
     return _write(figure, output_dir, "01_router_predictors_macro_f1_mock")
 
@@ -159,7 +191,12 @@ def _domain_mockup(output_dir: Path) -> list[str]:
     danish[0][-1] = 0.10
     for index in range(1, 7):
         danish[index][-1] = 0.04
-    figure = make_subplots(rows=1, cols=2, subplot_titles=("FlexOlmo-7x7B-1T-a4", "FlexDanish-8x7B-1T-a4-55B-v2"))
+    figure = make_subplots(
+        rows=1,
+        cols=2,
+        subplot_titles=("FlexOlmo-7x7B-1T-a4", "FlexDanish-8x7B-1T-a4-55B-v2"),
+        horizontal_spacing=0.20,
+    )
     for column, matrix, labels in ((1, base, base_experts), (2, danish, danish_experts)):
         figure.add_trace(
             go.Heatmap(
@@ -171,14 +208,14 @@ def _domain_mockup(output_dir: Path) -> list[str]:
                 zmax=0.65,
                 showscale=column == 2,
                 colorbar=dict(
-                    title=dict(text="Routing share", font=dict(size=13)),
+                    title=dict(text="Routing share", font=dict(size=19, family="Arial, sans-serif", weight=600), side="right"),
                     tickvals=[0.0, 0.2, 0.4, 0.6],
                     tickformat=".0%",
-                    len=0.75,
+                    len=0.72,
                     y=0.5,
-                    thickness=14,
-                    x=1.015,
-                    tickfont=dict(size=11),
+                    thickness=18,
+                    x=1.03,
+                    tickfont=dict(size=18, family="Arial, sans-serif", weight=600),
                 )
                 if column == 2
                 else None,
@@ -187,66 +224,160 @@ def _domain_mockup(output_dir: Path) -> list[str]:
             row=1,
             col=column,
         )
-        figure.update_xaxes(title="Held-out dataset domain", row=1, col=column)
-        figure.update_yaxes(title="Expert", autorange="reversed", row=1, col=column)
+        expected = [
+            ("Code", "Code"), ("Creative", "Creative"), ("Math", "Math"),
+            ("News", "News"), ("Academic", "Academic"), ("Reddit", "Reddit"),
+            ("Danish", "Danish" if "Danish" in labels else "Public"),
+        ]
+        figure.add_trace(
+            go.Scatter(
+                x=[domain for domain, _ in expected],
+                y=[expert for _, expert in expected],
+                mode="markers",
+                name="Expected domain expert",
+                showlegend=False,
+                marker=dict(symbol="square-open", size=17, color="#111111", line=dict(width=1.5, color="#111111")),
+                hovertemplate="Expected expert=%{y}<br>domain=%{x}<extra></extra>",
+            ),
+            row=1,
+            col=column,
+        )
+        figure.update_xaxes(title="Held-out dataset domain", tickangle=-35, automargin=True, row=1, col=column)
+        figure.update_yaxes(title="Expert", autorange="reversed", automargin=True, row=1, col=column)
     _style(
         figure,
-        "Expert allocation across held-out domains",
-        height=760,
+        "Observed expert routing by domain",
+        height=700,
         has_subplots=True,
     )
+    figure.update_layout(title_font=dict(size=21, family="Arial, sans-serif", weight=600))
+    figure.update_xaxes(
+        title_font=dict(size=19, family="Arial, sans-serif", weight=600),
+        tickfont=dict(size=18, family="Arial, sans-serif", weight=600),
+    )
+    figure.update_yaxes(
+        title_font=dict(size=19, family="Arial, sans-serif", weight=600),
+        tickfont=dict(size=18, family="Arial, sans-serif", weight=600),
+    )
+    for axis in figure.select_yaxes():
+        axis.domain = [0.0, 0.95]
+    for annotation in figure.layout.annotations or ():
+        annotation.y = 0.95
+        annotation.font = dict(size=20, family="Arial, sans-serif", weight=600, color=INK)
     return _write(figure, output_dir, "02_expert_domain_routing_mock")
+
+
+def _distribution_mockup(output_dir: Path) -> list[str]:
+    """Distributional routing view analogous to the RouterInterp appendices."""
+
+    figure = make_subplots(
+        rows=1,
+        cols=2,
+        subplot_titles=("Top-1 routing weight", "Normalised router entropy"),
+        horizontal_spacing=0.08,
+    )
+    models = (
+        ("FlexOlmo a4", "#6E98A3", 0.62, 0.56),
+        ("FlexDanish a4", "#063F59", 0.66, 0.49),
+        ("FlexDanish a4 RT", "#287F8C", 0.59, 0.53),
+    )
+    for index, (name, color, top1_center, entropy_center) in enumerate(models):
+        jitter = [0.09 * (((sample * (index + 3)) % 17) / 16 - 0.5) for sample in range(180)]
+        figure.add_trace(
+            go.Violin(
+                x=[name] * len(jitter), y=[max(0.05, min(0.98, top1_center + value)) for value in jitter],
+                name=name, legendgroup=name, showlegend=True, box_visible=True, meanline_visible=True,
+                line=dict(color=color, width=2), fillcolor=color, opacity=0.62,
+            ),
+            row=1, col=1,
+        )
+        figure.add_trace(
+            go.Violin(
+                x=[name] * len(jitter), y=[max(0.05, min(0.98, entropy_center - value)) for value in jitter],
+                name=name, legendgroup=name, showlegend=False, box_visible=True, meanline_visible=True,
+                line=dict(color=color, width=2), fillcolor=color, opacity=0.62,
+            ),
+            row=1, col=2,
+        )
+    figure.update_yaxes(title="Probability", range=[0.35, 0.80], row=1, col=1)
+    figure.update_yaxes(title="Normalised entropy", range=[0.35, 0.80], row=1, col=2)
+    figure.update_xaxes(showticklabels=False, row=1, col=1)
+    figure.update_xaxes(showticklabels=False, row=1, col=2)
+    _style(figure, "Router-weight distributions across Flex configurations", height=560, has_subplots=True)
+    figure.update_layout(
+        title=dict(y=0.985, font=dict(size=22, family="Arial, sans-serif", weight=600)),
+        legend=dict(y=0.88, font=dict(size=19, family="Arial, sans-serif", weight=600)),
+    )
+    figure.update_xaxes(
+        title_font=dict(size=20, family="Arial, sans-serif", weight=600),
+        tickfont=dict(size=18, family="Arial, sans-serif", weight=600),
+    )
+    figure.update_yaxes(
+        title_font=dict(size=20, family="Arial, sans-serif", weight=600),
+        tickfont=dict(size=18, family="Arial, sans-serif", weight=600),
+    )
+    for annotation in figure.layout.annotations or ():
+        annotation.y = 0.95
+        annotation.font = dict(size=21, family="Arial, sans-serif", weight=600, color=INK)
+    for axis in figure.select_yaxes():
+        if axis.domain is not None:
+            axis.domain = [float(axis.domain[0]), 0.95]
+    return _write(figure, output_dir, "05_router_weight_distributions_mock")
 
 
 def _configuration_mockup(output_dir: Path) -> list[str]:
     labels = [
-        "FlexOlmo-7x7B-1T<br>a2",
-        "FlexOlmo-7x7B-1T<br>a4",
-        "FlexOlmo-7x7B-1T<br>a7",
-        "FlexDanish-8x7B-1T<br>a2-55B-v2",
-        "FlexDanish-8x7B-1T<br>a4-55B-v2",
-        "FlexDanish-8x7B-1T<br>a4-55B-v2-RT",
-        "FlexDanish-8x7B-1T<br>a7-55B-v2",
-        "FlexDanish-8x7B-1T<br>a8-55B-v2",
-        "FlexDanish-8x7B-1T<br>a8-55B-v2-RT",
+        "FlexOlmo-7x7B-a2",
+        "FlexOlmo-7x7B-a4",
+        "FlexOlmo-7x7B-a7",
+        "FlexDanish-8x7B-a2-55B-v2",
+        "FlexDanish-8x7B-a4-55B-v2",
+        "FlexDanish-8x7B-a4-55B-v2-RT",
+        "FlexDanish-8x7B-a7-55B-v2",
+        "FlexDanish-8x7B-a8-55B-v2",
+        "FlexDanish-8x7B-a8-55B-v2-RT",
     ]
     entropy = [0.42, 0.60, 0.92, 0.44, 0.63, 0.58, 0.90, 0.98, 0.94]
     top1 = [0.73, 0.54, 0.29, 0.70, 0.50, 0.55, 0.30, 0.25, 0.27]
     danish_share = [0.0, 0.0, 0.0, 0.17, 0.21, 0.27, 0.16, 0.13, 0.19]
     figure = make_subplots(
-        rows=1,
-        cols=3,
+        rows=3,
+        cols=1,
         subplot_titles=("Router entropy", "Top-1 routing weight", "Danish-expert selection share"),
-        horizontal_spacing=0.07,
-        shared_yaxes=True,
+        vertical_spacing=0.055,
+        shared_xaxes=True,
     )
     colors = ["#6E98A3" if label.startswith("FlexOlmo") else "#063F59" for label in labels]
-    for column, values, axis_title in (
-        (1, entropy, "Normalised entropy"),
-        (2, top1, "Mean top-1 weight"),
-        (3, danish_share, "Selection share"),
+    for row, values, axis_title in (
+        (1, entropy, "Router entropy"),
+        (2, top1, "Top-1 weight"),
+        (3, danish_share, "Danish selection"),
     ):
         figure.add_trace(
-            go.Bar(y=labels, x=values, orientation="h", marker_color=colors, showlegend=False), row=1, col=column
+            go.Bar(x=labels, y=values, marker_color=colors, showlegend=False), row=row, col=1
         )
-        figure.update_xaxes(title=axis_title, range=[0, 1], row=1, col=column)
-        figure.update_yaxes(
-            autorange="reversed",
-            showticklabels=column == 1,
-            tickmode="array",
-            tickvals=labels,
-            ticktext=labels,
-            row=1,
-            col=column,
-        )
+        figure.update_yaxes(title=axis_title, range=[0, 1], row=row, col=1)
+    figure.update_xaxes(tickangle=-28, automargin=True, tickfont=dict(size=22), row=3, col=1)
     _style(
         figure,
-        "Router dynamics across Flex configurations",
-        height=980,
+        "FlexOlmo-7x7B and FlexDanish-8x7B-55B-v2 router configuration summary",
+        height=920,
         has_subplots=True,
     )
-    figure.update_layout(margin=dict(l=330, r=70, t=88, b=58))
-    figure.update_yaxes(tickfont=dict(size=13, family="Arial, sans-serif"), row=1, col=1)
+    # Keep the first panel close to the main title without moving the lower rows.
+    figure.update_layout(title=dict(y=0.99, font=dict(size=20, family="Arial, sans-serif", weight=600)))
+    figure.update_xaxes(
+        title_font=dict(size=18, family="Arial, sans-serif", weight=600),
+        tickfont=dict(size=17, family="Arial, sans-serif", weight=600),
+    )
+    figure.update_yaxes(
+        title_font=dict(size=18, family="Arial, sans-serif", weight=600),
+        tickfont=dict(size=17, family="Arial, sans-serif", weight=600),
+    )
+    figure.layout.yaxis.domain = [float(figure.layout.yaxis.domain[0]), 0.935]
+    for annotation in figure.layout.annotations or ():
+        annotation.font = dict(size=19, family="Arial, sans-serif", weight=600, color=INK)
+    figure.layout.annotations[0].y = 0.96
     return _write(figure, output_dir, "03_router_configuration_summary_mock")
 
 
@@ -255,7 +386,7 @@ def _sae_mockup(output_dir: Path) -> list[str]:
         rows=1,
         cols=3,
         subplot_titles=("Feature-budget sensitivity", "SAE feature health", "Feature/router agreement"),
-        horizontal_spacing=0.10,
+        horizontal_spacing=0.08,
     )
     budgets = ["1", "2", "4", "8", "16", "32"]
     for name, offset, color in (("FlexOlmo-7x7B-1T-a4", 0.0, "#4F8A96"), ("FlexDanish-8x7B-1T-a4-55B-v2", 0.035, "#063F59")):
@@ -274,26 +405,168 @@ def _sae_mockup(output_dir: Path) -> list[str]:
     _style(
         figure,
         "Sparse-feature diagnostics",
-        height=690,
-        legend_below=True,
+        height=650,
         has_subplots=True,
     )
+    figure.update_layout(
+        title=dict(y=0.985, font=dict(size=22, family="Arial, sans-serif", weight=600)),
+        legend=dict(y=0.89, font=dict(size=19, family="Arial, sans-serif", weight=600)),
+    )
+    figure.update_xaxes(
+        title_font=dict(size=20, family="Arial, sans-serif", weight=600),
+        tickfont=dict(size=17, family="Arial, sans-serif", weight=600),
+    )
+    figure.update_yaxes(
+        title_font=dict(size=20, family="Arial, sans-serif", weight=600),
+        tickfont=dict(size=17, family="Arial, sans-serif", weight=600),
+    )
+    for axis in figure.select_yaxes():
+        if axis.domain is not None:
+            axis.domain = [float(axis.domain[0]), 0.96]
+    for annotation in figure.layout.annotations or ():
+        annotation.y = 0.95
+        annotation.font = dict(size=21, family="Arial, sans-serif", weight=600, color=INK)
     return _write(figure, output_dir, "04_sae_router_diagnostics_mock")
+
+
+def _model_summary_mockups(output_dir: Path) -> list[str]:
+    """Create one appendix-style router summary layout for every configuration."""
+
+    paths: list[str] = []
+    domains = ["Code", "Creative", "Math", "News", "Academic", "Reddit", "Danish"]
+    for index, (model_key, model_label) in enumerate(MODEL_LABELS.items()):
+        figure = make_subplots(
+            rows=2,
+            cols=2,
+            subplot_titles=(
+                "Routing-predictor macro-F1",
+                "Router concentration",
+                "Observed expert routing",
+                "Sparse-feature health",
+            ),
+            horizontal_spacing=0.16,
+            vertical_spacing=0.15,
+        )
+        layers = [f"L{layer}" for layer in LAYERS]
+        model_offset = 0.004 * (index % 4)
+        for name, base, color in (
+            ("PCA", 0.57, "#287F8C"),
+            ("ITDA", 0.61, "#4B7586"),
+            ("SAE", 0.66, "#063F59"),
+        ):
+            figure.add_trace(
+                go.Scatter(
+                    x=layers,
+                    y=[base + model_offset + 0.006 * layer_index for layer_index in range(len(layers))],
+                    mode="lines+markers",
+                    name=name,
+                    legendgroup=name,
+                    line=dict(color=color, width=3 if name == "SAE" else 2.4),
+                    marker=dict(size=8),
+                ),
+                row=1,
+                col=1,
+            )
+        figure.add_trace(
+            go.Bar(
+                x=layers,
+                y=[0.48 + 0.06 * ((index + layer_index) % 4) for layer_index in range(len(layers))],
+                name="Top-1 weight",
+                marker_color="#5C98A5",
+                showlegend=False,
+            ),
+            row=1,
+            col=2,
+        )
+        experts = ["Public", "Code", "Creative", "Math", "News", "Academic", "Reddit"]
+        if model_key.startswith("flexdanish"):
+            experts.append("Danish")
+        routing = []
+        for expert_index in range(len(experts)):
+            row = [0.05 + 0.01 * ((expert_index + domain_index + index) % 4) for domain_index in range(len(domains))]
+            row[(expert_index + index) % len(domains)] = 0.44 + 0.03 * (index % 3)
+            routing.append(row)
+        figure.add_trace(
+            go.Heatmap(
+                z=routing,
+                x=domains,
+                y=experts,
+                colorscale=BLUE_HEATMAP,
+                zmin=0,
+                zmax=0.55,
+                showscale=True,
+                colorbar=dict(
+                    title=dict(text="Routing share", side="right", font=dict(size=20, family="Arial, sans-serif", weight=600)),
+                    tickvals=[0.0, 0.2, 0.4],
+                    tickformat=".0%",
+                    tickfont=dict(size=18, family="Arial, sans-serif", weight=600),
+                    thickness=16,
+                    len=0.26,
+                    y=0.205,
+                    x=0.48,
+                ),
+                showlegend=False,
+            ),
+            row=2,
+            col=1,
+        )
+        figure.add_trace(
+            go.Bar(
+                x=layers,
+                y=[0.24, 0.20, 0.16, 0.19, 0.23],
+                name="Dead features",
+                marker_color="#287F8C",
+                showlegend=False,
+            ),
+            row=2,
+            col=2,
+        )
+        figure.update_xaxes(title=None, row=1, col=1)
+        figure.update_yaxes(title="Macro-F1", range=[0.45, 0.75], row=1, col=1)
+        figure.update_xaxes(title=None, row=1, col=2)
+        figure.update_yaxes(title="Top-1 weight", range=[0, 1], row=1, col=2)
+        figure.update_xaxes(title="Dataset domain", tickangle=-30, row=2, col=1)
+        figure.update_yaxes(title="Expert", autorange="reversed", row=2, col=1)
+        figure.update_xaxes(title="Router layer", row=2, col=2)
+        figure.update_yaxes(title="Dead-feature share", range=[0, 1], row=2, col=2)
+        figure.update_yaxes(side="right", row=2, col=2)
+        _style(figure, f"{model_label}: router summary", height=820, has_subplots=True)
+        figure.update_layout(
+            title=dict(y=0.985, font=dict(size=22, family="Arial, sans-serif", weight=600)),
+            legend=dict(y=0.88, font=dict(size=19, family="Arial, sans-serif", weight=600)),
+        )
+        figure.update_xaxes(
+            title_font=dict(size=20, family="Arial, sans-serif", weight=600),
+            tickfont=dict(size=17, family="Arial, sans-serif", weight=600),
+        )
+        figure.update_yaxes(
+            title_font=dict(size=20, family="Arial, sans-serif", weight=600),
+            tickfont=dict(size=17, family="Arial, sans-serif", weight=600),
+        )
+        figure.layout.yaxis.domain = [0.54, 0.96]
+        figure.layout.yaxis2.domain = [0.54, 0.96]
+        figure.layout.yaxis3.domain = [0.06, 0.35]
+        figure.layout.yaxis4.domain = [0.06, 0.35]
+        for annotation_index, annotation in enumerate(figure.layout.annotations or ()):
+            annotation.y = 0.97 if annotation_index < 2 else 0.40
+            annotation.font = dict(size=21, family="Arial, sans-serif", weight=600, color=INK)
+        paths.extend(_write(figure, output_dir, f"06_router_summary_{model_key}_mock"))
+    return paths
 
 
 def _write_tables(output_dir: Path) -> list[str]:
     predictors = output_dir / "table_router_predictors_mock.tex"
     predictors.write_text(
         """% ILLUSTRATIVE MOCKUP -- synthetic values, not measured results.
-\\begin{tabular}{llrrrrr}
+\\begin{tabular}{llrrrrrr}
 \\toprule
-Model & Layers & Unigram & Bigram & Neuron & PCA & SAE \\\\
+Model & Layers & Unigram & Bigram & Neuron & PCA & ITDA & SAE \\\\
 \\midrule
-FlexOlmo-7x7B-1T-a2 & L5--L31 & 0.42 & 0.48 & 0.54 & 0.57 & 0.66 \\\\
-FlexOlmo-7x7B-1T-a4 & L5--L31 & 0.39 & 0.45 & 0.51 & 0.55 & 0.62 \\\\
-FlexDanish-8x7B-1T-a2-55B-v2 & L5--L31 & 0.44 & 0.50 & 0.56 & 0.59 & 0.68 \\\\
-FlexDanish-8x7B-1T-a4-55B-v2 & L5--L31 & 0.43 & 0.49 & 0.55 & 0.58 & 0.67 \\\\
-FlexDanish-8x7B-1T-a4-55B-v2-RT & L5--L31 & 0.45 & 0.51 & 0.57 & 0.60 & 0.70 \\\\
+FlexOlmo-7x7B-1T-a2 & L5--L31 & 0.42 & 0.48 & 0.54 & 0.57 & 0.61 & 0.66 \\\\
+FlexOlmo-7x7B-1T-a4 & L5--L31 & 0.39 & 0.45 & 0.51 & 0.55 & 0.59 & 0.62 \\\\
+FlexDanish-8x7B-1T-a2-55B-v2 & L5--L31 & 0.44 & 0.50 & 0.56 & 0.59 & 0.63 & 0.68 \\\\
+FlexDanish-8x7B-1T-a4-55B-v2 & L5--L31 & 0.43 & 0.49 & 0.55 & 0.58 & 0.62 & 0.67 \\\\
+FlexDanish-8x7B-1T-a4-55B-v2-RT & L5--L31 & 0.45 & 0.51 & 0.57 & 0.60 & 0.65 & 0.70 \\\\
 \\bottomrule
 \\end{tabular}
 """,
@@ -325,7 +598,7 @@ FlexDanish-8x7B-1T-a8-55B-v2-RT & 0.94 & 0.27 & 0.19 \\\\
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", default="tmp/routerinterp/mockups", help="Directory under project tmp/.")
+    parser.add_argument("--output", default="tmp/routerinterp/mockups_v3", help="Directory under project tmp/.")
     args = parser.parse_args()
     output_dir = _output_path(args.output)
     artifacts = [
@@ -333,6 +606,8 @@ def main() -> None:
         *_domain_mockup(output_dir),
         *_configuration_mockup(output_dir),
         *_sae_mockup(output_dir),
+        *_distribution_mockup(output_dir),
+        *_model_summary_mockups(output_dir),
         *_write_tables(output_dir),
     ]
     manifest = {

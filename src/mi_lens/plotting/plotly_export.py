@@ -13,7 +13,9 @@ def _to_image_bytes(fig: go.Figure, *, format: str, scale: int = 2) -> bytes:
 
 def _write_plotly_pdf(fig: go.Figure, output_path: Path) -> Path:
     try:
-        pdf_bytes = _to_image_bytes(fig, format="pdf", scale=2)
+        # Vector PDFs should retain the figure's native physical size. Scaling
+        # them here doubles the page and makes all type too small after LaTeX.
+        pdf_bytes = _to_image_bytes(fig, format="pdf", scale=1)
         output_path.write_bytes(pdf_bytes)
         return output_path
     except Exception:

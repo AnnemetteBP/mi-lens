@@ -30,20 +30,34 @@ class TopKSAE(nn.Module):
 
     @torch.no_grad()
     def normalize_decoder(self) -> None:
-        self.decoder.weight.div_(self.decoder.weight.norm(dim=0, keepdim=True).clamp_min(1e-8))
+        if not torch.isfinite(self.decoder.weight).all():
+            raise ValueError("Top-K SAE decoder contains NaN or infinity.")
+        norms = self.decoder.weight.norm(dim=0, keepdim=True)
+        if (norms <= 1e-8).any():
+            raise ValueError("Top-K SAE decoder contains a zero-norm feature direction.")
+        self.decoder.weight.div_(norms)
 
     def encode(self, activations: torch.Tensor) -> torch.Tensor:
         if activations.shape[-1] != self.config.d_model:
             raise ValueError(
                 f"Expected d_model={self.config.d_model}, got {activations.shape[-1]}."
             )
+        if not torch.isfinite(activations).all():
+            raise ValueError("Top-K SAE activations contain NaN or infinity.")
         dense = torch.relu(self.encoder(activations - self.decoder_bias))
+        if not torch.isfinite(dense).all():
+            raise ValueError("Top-K SAE encoder produced NaN or infinity.")
         values, indices = dense.topk(k=self.config.k, dim=-1)
         sparse = torch.zeros_like(dense)
         return sparse.scatter(-1, indices, values)
 
     def decode(self, features: torch.Tensor) -> torch.Tensor:
-        return self.decoder(features) + self.decoder_bias
+        if not torch.isfinite(features).all():
+            raise ValueError("Top-K SAE features contain NaN or infinity.")
+        reconstruction = self.decoder(features) + self.decoder_bias
+        if not torch.isfinite(reconstruction).all():
+            raise ValueError("Top-K SAE decoder produced NaN or infinity.")
+        return reconstruction
 
     def forward(self, activations: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         features = self.encode(activations)
@@ -79,6 +93,10 @@ def fit_topk_sae(
         raise ValueError("Activation width does not match SAE d_model.")
     if steps < 1 or batch_size < 1:
         raise ValueError("`steps` and `batch_size` must be positive.")
+    if learning_rate <= 0 or not torch.isfinite(torch.tensor(learning_rate)):
+        raise ValueError("`learning_rate` must be finite and positive.")
+    if not torch.isfinite(activations).all():
+        raise ValueError("SAE fitting activations contain NaN or infinity.")
 
     model = TopKSAE(config).to(activations.device, dtype=activations.dtype)
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
@@ -94,6 +112,8 @@ def fit_topk_sae(
         batch = activations[indices]
         reconstruction, _ = model(batch)
         loss = torch.nn.functional.mse_loss(reconstruction, batch)
+        if not torch.isfinite(loss) or loss < 0:
+            raise ValueError("Top-K SAE loss became invalid.")
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()

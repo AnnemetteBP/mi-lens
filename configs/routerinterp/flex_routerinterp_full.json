@@ -25,6 +25,14 @@
     "primary_active_features": 32,
     "top_rho_features": 20,
     "sae": {"k": 32},
+    "itda": {
+      "enabled": true,
+      "fit_tokens": 1000000,
+      "batch_size": 64,
+      "max_atoms": 32768,
+      "k": 32,
+      "loss_threshold": 0.1
+    },
     "probe": {"steps": 500, "learning_rate": 0.001},
     "seed": 0
   },

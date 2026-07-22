@@ -32,6 +32,8 @@ __all__ = [
     "TopKSAE",
     "TopKSAEConfig",
     "fit_topk_sae",
+    "ITDA",
+    "ITDAConfig",
 ]
 
 from .feature_capture import ResidualCaptureConfig, capture_residual_activation_shards
@@ -53,3 +55,4 @@ from .router_interp import (
     top_rho_features,
 )
 from .sae import TopKSAE, TopKSAEConfig, fit_topk_sae
+from .itda import ITDA, ITDAConfig

@@ -17,6 +17,25 @@ from mi_lens.adapters.router_outputs import (
 )
 
 
+def _require_finite(name: str, values: torch.Tensor) -> None:
+    if not torch.isfinite(values).all():
+        raise ValueError(f"{name} contains NaN or infinity.")
+
+
+def _require_probability_rows(name: str, probabilities: torch.Tensor) -> None:
+    """Reject malformed router distributions instead of silently normalising them."""
+
+    if probabilities.ndim < 2 or probabilities.shape[-1] < 1:
+        raise ValueError(f"{name} must have a non-empty expert dimension.")
+    _require_finite(name, probabilities)
+    tolerance = 2e-3 if probabilities.dtype in (torch.float16, torch.bfloat16) else 1e-5
+    if (probabilities < -tolerance).any() or (probabilities > 1.0 + tolerance).any():
+        raise ValueError(f"{name} contains values outside [0, 1].")
+    sums = probabilities.float().sum(dim=-1)
+    if not torch.allclose(sums, torch.ones_like(sums), rtol=tolerance, atol=tolerance):
+        raise ValueError(f"{name} rows are not normalised probability distributions.")
+
+
 @dataclass(slots=True)
 class RouterLayerCapture:
     router_input: torch.Tensor
@@ -87,7 +106,13 @@ def capture_flexolmo_router_layers(
             scores_are_probabilities=None,
         )[0]
         router_input = _as_batch_sequence(router_input, batch_size, sequence_length).float()
+        _require_finite("pre-router activations", router_input)
+        _require_probability_rows("router probabilities", probabilities)
         effective_top_k = top_k or int(getattr(model.config, "num_experts_per_tok", 1))
+        if not 1 <= effective_top_k <= probabilities.shape[-1]:
+            raise ValueError(
+                f"Router top-k={effective_top_k} is invalid for {probabilities.shape[-1]} experts."
+            )
         captures.append(
             RouterLayerCapture(
                 router_input=router_input,
@@ -212,8 +237,14 @@ def capture_routerinterp_prompt_artifacts(
 def selected_expert_targets(selected_experts: torch.Tensor, num_experts: int) -> torch.Tensor:
     """Convert top-k ids into multi-label routing targets ``(token, expert)``."""
 
-    if selected_experts.ndim != 2:
+    if selected_experts.ndim != 2 or num_experts < 1:
         raise ValueError("Expected selected experts with shape (token, top_k).")
+    if selected_experts.numel() == 0:
+        raise ValueError("Selected experts cannot be empty.")
+    if (selected_experts < 0).any() or (selected_experts >= num_experts).any():
+        raise ValueError("Selected expert ids are outside the router expert range.")
+    if (selected_experts.sort(dim=1).values[:, 1:] == selected_experts.sort(dim=1).values[:, :-1]).any():
+        raise ValueError("Each token's routed expert ids must be unique.")
     targets = torch.zeros(
         (selected_experts.shape[0], num_experts),
         dtype=torch.float32,
@@ -229,6 +260,8 @@ def rho_usefulness(features: torch.Tensor, expert_targets: torch.Tensor) -> torc
         raise ValueError("Features and expert targets must both be two-dimensional.")
     if features.shape[0] != expert_targets.shape[0]:
         raise ValueError("Features and expert targets must have the same token count.")
+    _require_finite("feature activations", features)
+    _require_finite("expert targets", expert_targets)
     scores = []
     for expert_index in range(expert_targets.shape[1]):
         selected = expert_targets[:, expert_index].bool()
@@ -239,12 +272,17 @@ def rho_usefulness(features: torch.Tensor, expert_targets: torch.Tensor) -> torc
             scores.append(torch.zeros(features.shape[1], device=features.device, dtype=features.dtype))
             continue
         scores.append(features[selected].mean(0) - features[~selected].mean(0))
-    return torch.stack(scores)
+    result = torch.stack(scores)
+    _require_finite("rho usefulness", result)
+    return result
 
 
 def top_rho_features(rho_scores: torch.Tensor, n_features: int = 20) -> tuple[torch.Tensor, torch.Tensor]:
     """Select the most routing-predictive SAE latents for each expert."""
 
+    if rho_scores.ndim != 2 or rho_scores.shape[1] < 1 or n_features < 1:
+        raise ValueError("rho scores must be non-empty (expert, feature) values.")
+    _require_finite("rho scores", rho_scores)
     values, indices = rho_scores.topk(k=min(n_features, rho_scores.shape[1]), dim=1)
     return indices, values
 
@@ -269,10 +307,20 @@ def fit_routing_probe(
 ) -> RoutingProbe:
     """Fit RouterInterp's multi-label logistic routing predictor."""
 
+    if features.ndim != 2 or expert_targets.ndim != 2 or features.shape[0] != expert_targets.shape[0]:
+        raise ValueError("Routing probes require aligned non-empty feature and target matrices.")
+    if features.shape[0] < 1 or steps < 1 or learning_rate <= 0:
+        raise ValueError("Routing probe inputs, steps, and learning_rate must be positive.")
+    _require_finite("routing-probe features", features)
+    _require_finite("routing-probe targets", expert_targets)
+    if (expert_targets < 0).any() or (expert_targets > 1).any():
+        raise ValueError("Routing probe targets must be binary.")
     probe = RoutingProbe(features.shape[1], expert_targets.shape[1]).to(features.device)
     optimizer = torch.optim.AdamW(probe.parameters(), lr=learning_rate, weight_decay=1e-4)
     for _ in range(steps):
         loss = torch.nn.functional.binary_cross_entropy_with_logits(probe(features), expert_targets)
+        if not torch.isfinite(loss):
+            raise ValueError("Routing probe loss became NaN or infinity.")
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -284,7 +332,10 @@ def routing_recall(probe_logits: torch.Tensor, expert_targets: torch.Tensor, *, 
 
     predicted = probe_logits.topk(k=top_k, dim=-1).indices
     predicted_targets = selected_expert_targets(predicted, expert_targets.shape[1])
-    return float((predicted_targets * expert_targets).sum(-1).div(top_k).mean().item())
+    result = float((predicted_targets * expert_targets).sum(-1).div(top_k).mean().item())
+    if not 0.0 <= result <= 1.0:
+        raise ValueError("Routing recall is outside [0, 1].")
+    return result
 
 
 def top_k_expert_predictions(scores: torch.Tensor, *, top_k: int) -> torch.Tensor:
@@ -310,9 +361,12 @@ def macro_f1_expert_routing(predicted_targets: torch.Tensor, expert_targets: tor
     true_positive = (predicted & actual).sum(0).float()
     false_positive = (predicted & ~actual).sum(0).float()
     false_negative = (~predicted & actual).sum(0).float()
-    return float(
+    result = float(
         (2 * true_positive / (2 * true_positive + false_positive + false_negative).clamp_min(1)).mean().item()
     )
+    if not 0.0 <= result <= 1.0:
+        raise ValueError("Macro-F1 is outside [0, 1].")
+    return result
 
 
 def sparse_by_magnitude(values: torch.Tensor, *, k: int) -> torch.Tensor:
@@ -320,6 +374,7 @@ def sparse_by_magnitude(values: torch.Tensor, *, k: int) -> torch.Tensor:
 
     if values.ndim != 2 or not 1 <= k <= values.shape[1]:
         raise ValueError("Values must be (token, feature) and `k` must be valid.")
+    _require_finite("values to sparsify", values)
     indices = values.abs().topk(k=k, dim=-1).indices
     sparse = torch.zeros_like(values)
     return sparse.scatter(1, indices, values.gather(1, indices))
@@ -328,22 +383,35 @@ def sparse_by_magnitude(values: torch.Tensor, *, k: int) -> torch.Tensor:
 def feature_coactivation_ratio(features: torch.Tensor, feature_indices_by_expert: torch.Tensor) -> list[dict[str, float | int]]:
     """Paper-style feature co-activation relative to independence for each expert."""
 
-    active = features > 0
+    if features.ndim != 2 or feature_indices_by_expert.ndim != 2:
+        raise ValueError("Feature coactivation requires feature and index matrices.")
+    _require_finite("feature activations", features)
+    if (feature_indices_by_expert < 0).any() or (feature_indices_by_expert >= features.shape[1]).any():
+        raise ValueError("Feature coactivation indices are outside the feature range.")
+    # Top-K SAE features are non-negative, while ITDA matching-pursuit
+    # coefficients are signed. A feature is active when its magnitude is nonzero.
+    active = features.abs() > 1e-12
     results = []
     for expert_index, indices in enumerate(feature_indices_by_expert):
         selected = active[:, indices]
         pair_ratios = []
+        undefined_pairs = 0
         for left in range(selected.shape[1]):
             for right in range(left + 1, selected.shape[1]):
                 observed = (selected[:, left] & selected[:, right]).float().mean()
                 expected = selected[:, left].float().mean() * selected[:, right].float().mean()
-                pair_ratios.append(
-                    (
-                        float(observed.item()),
-                        float(expected.item()),
-                        float((observed / expected.clamp_min(1e-8)).item()),
-                    )
-                )
+                observed_value, expected_value = float(observed.item()), float(expected.item())
+                if expected_value <= 1e-12:
+                    # A ratio is mathematically undefined when both features
+                    # never fire.  Exclude rather than emit a fake huge value.
+                    if observed_value > 1e-12:
+                        raise ValueError("Observed coactivation is positive despite zero independent expectation.")
+                    undefined_pairs += 1
+                    continue
+                ratio = observed_value / expected_value
+                if not torch.isfinite(torch.tensor(ratio)) or ratio < 0:
+                    raise ValueError("Feature coactivation ratio is invalid.")
+                pair_ratios.append((observed_value, expected_value, ratio))
         observed_values = [value[0] for value in pair_ratios]
         expected_values = [value[1] for value in pair_ratios]
         ratio_values = [value[2] for value in pair_ratios]
@@ -352,6 +420,7 @@ def feature_coactivation_ratio(features: torch.Tensor, feature_indices_by_expert
                 "expert": expert_index,
                 "feature_count": int(selected.shape[1]),
                 "pair_count": len(pair_ratios),
+                "undefined_zero_expectation_pair_count": undefined_pairs,
                 "mean_feature_firing_rate": float(selected.float().mean().item()),
                 "mean_observed_coactivation": float(torch.tensor(observed_values).mean().item()) if observed_values else 0.0,
                 "mean_independence_expectation": float(torch.tensor(expected_values).mean().item()) if expected_values else 0.0,
@@ -372,10 +441,11 @@ def feature_activation_diagnostics(features: torch.Tensor) -> dict[str, float | 
 
     if features.ndim != 2 or features.shape[0] < 1:
         raise ValueError("Expected non-empty (token, feature) activations.")
-    active = features > 0
+    _require_finite("feature activations", features)
+    active = features.abs() > 1e-12
     firing_rates = active.float().mean(0)
     activation_means = features.mean(0)
-    return {
+    result = {
         "feature_count": int(features.shape[1]),
         "token_count": int(features.shape[0]),
         "dead_feature_count": int((firing_rates == 0).sum().item()),
@@ -386,3 +456,7 @@ def feature_activation_diagnostics(features: torch.Tensor) -> dict[str, float | 
         "mean_feature_activation": float(activation_means.mean().item()),
         "median_feature_activation": float(activation_means.median().item()),
     }
+    for key in ("dead_feature_fraction", "mean_feature_firing_rate", "median_feature_firing_rate", "p95_feature_firing_rate"):
+        if not 0.0 <= float(result[key]) <= 1.0:
+            raise ValueError(f"{key} is outside [0, 1].")
+    return result
