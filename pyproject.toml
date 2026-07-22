@@ -37,6 +37,10 @@ dev = [
 notebooks = [
     "ipywidgets",
 ]
+reporting = [
+    "kaleido>=1.0",
+    "Pillow>=10.0",
+]
 slow_tokenizers = [
     "sentencepiece>=0.1.99",
 ]

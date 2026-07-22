@@ -337,11 +337,52 @@ def feature_coactivation_ratio(features: torch.Tensor, feature_indices_by_expert
             for right in range(left + 1, selected.shape[1]):
                 observed = (selected[:, left] & selected[:, right]).float().mean()
                 expected = selected[:, left].float().mean() * selected[:, right].float().mean()
-                pair_ratios.append(float((observed / expected.clamp_min(1e-8)).item()))
+                pair_ratios.append(
+                    (
+                        float(observed.item()),
+                        float(expected.item()),
+                        float((observed / expected.clamp_min(1e-8)).item()),
+                    )
+                )
+        observed_values = [value[0] for value in pair_ratios]
+        expected_values = [value[1] for value in pair_ratios]
+        ratio_values = [value[2] for value in pair_ratios]
         results.append(
             {
                 "expert": expert_index,
-                "median_coactivation_ratio": float(torch.tensor(pair_ratios).median().item()) if pair_ratios else 1.0,
+                "feature_count": int(selected.shape[1]),
+                "pair_count": len(pair_ratios),
+                "mean_feature_firing_rate": float(selected.float().mean().item()),
+                "mean_observed_coactivation": float(torch.tensor(observed_values).mean().item()) if observed_values else 0.0,
+                "mean_independence_expectation": float(torch.tensor(expected_values).mean().item()) if expected_values else 0.0,
+                "median_coactivation_ratio": float(torch.tensor(ratio_values).median().item()) if ratio_values else 1.0,
+                "mean_coactivation_ratio": float(torch.tensor(ratio_values).mean().item()) if ratio_values else 1.0,
+                "zero_coactivation_pair_fraction": (
+                    float(sum(value == 0.0 for value in observed_values) / len(observed_values))
+                    if observed_values
+                    else 0.0
+                ),
             }
         )
     return results
+
+
+def feature_activation_diagnostics(features: torch.Tensor) -> dict[str, float | int]:
+    """Summarise feature use on a fixed held-out token set."""
+
+    if features.ndim != 2 or features.shape[0] < 1:
+        raise ValueError("Expected non-empty (token, feature) activations.")
+    active = features > 0
+    firing_rates = active.float().mean(0)
+    activation_means = features.mean(0)
+    return {
+        "feature_count": int(features.shape[1]),
+        "token_count": int(features.shape[0]),
+        "dead_feature_count": int((firing_rates == 0).sum().item()),
+        "dead_feature_fraction": float((firing_rates == 0).float().mean().item()),
+        "mean_feature_firing_rate": float(firing_rates.mean().item()),
+        "median_feature_firing_rate": float(firing_rates.median().item()),
+        "p95_feature_firing_rate": float(torch.quantile(firing_rates, 0.95).item()),
+        "mean_feature_activation": float(activation_means.mean().item()),
+        "median_feature_activation": float(activation_means.median().item()),
+    }

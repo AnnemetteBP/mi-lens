@@ -8,6 +8,7 @@
     "flexmore_checkpoint": "Flex-danish-2x7B-55B-v2-bf16",
     "dtype": "bfloat16",
     "trust_remote_code": true,
+    "tokenizer_class": "GPT2Tokenizer",
     "low_cpu_mem_usage": true
   },
   "prompt_path": "data/eval/mkqa_da_eval_5000.jsonl",

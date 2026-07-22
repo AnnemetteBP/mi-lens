@@ -22,6 +22,7 @@ class ModelLoadConfig:
     flexmore_checkpoint: str | None = None
     flexmore_model_root: str | None = None
     tokenizer_name: str | None = None
+    tokenizer_class: str | None = None
     tokenizer_type: str | None = None
     use_fast_tokenizer: bool | None = None
     fix_mistral_regex: bool = True
@@ -163,7 +164,18 @@ def load_model_and_tokenizer(
         tokenizer_kwargs["use_fast"] = config.use_fast_tokenizer
 
     tokenizer_source = config.tokenizer_name or model_source
-    if config.fix_mistral_regex:
+    if config.tokenizer_class == "GPT2Tokenizer":
+        # Flex checkpoints specify GPT2Tokenizer in tokenizer_config.json. Pin the
+        # slow class to match the established FlexEval loading path exactly.
+        tokenizer_kwargs.pop("tokenizer_type", None)
+        tokenizer_kwargs.pop("use_fast", None)
+        tokenizer = transformers.GPT2Tokenizer.from_pretrained(tokenizer_source, **tokenizer_kwargs)
+    elif config.tokenizer_class is not None:
+        raise ValueError(
+            f"Unsupported explicit tokenizer class {config.tokenizer_class!r}. "
+            "Supported explicit classes: GPT2Tokenizer."
+        )
+    elif config.fix_mistral_regex:
         try:
             tokenizer = transformers.AutoTokenizer.from_pretrained(
                 tokenizer_source,

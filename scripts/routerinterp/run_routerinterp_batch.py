@@ -183,6 +183,24 @@ def main() -> None:
     if not isinstance(jobs, list) or not jobs:
         raise ValueError("Batch config must contain a non-empty `jobs` list.")
 
+    dataset_config_value = batch_config.get("dataset_config_path")
+    if dataset_config_value:
+        from mi_lens.methods.router_data_prep import warm_router_dataset_cache_from_config
+
+        dataset_config_path = _resolve(project_root, str(dataset_config_value)).resolve()
+        if not dataset_config_path.is_file():
+            raise FileNotFoundError(f"Missing router dataset config: {dataset_config_path}")
+        print(f"[start] warming shared dataset cache from {dataset_config_path}", flush=True)
+        cache_manifest = warm_router_dataset_cache_from_config(
+            dataset_config_path,
+            project_root=project_root,
+        )
+        cache_manifest_path = (
+            project_root / "tmp" / "routerinterp" / "batch_state" / _safe_name(batch_name) / "dataset_cache.json"
+        )
+        _write_json_atomic(cache_manifest_path, cache_manifest)
+        print(f"[done] shared dataset cache: {cache_manifest['cache_dir']}", flush=True)
+
     continue_on_error = bool(batch_config.get("continue_on_error", False) or args.continue_on_error)
     failures: list[dict[str, str]] = []
     for job_index, job in enumerate(jobs):

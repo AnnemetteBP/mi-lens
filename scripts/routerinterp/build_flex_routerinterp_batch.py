@@ -56,6 +56,7 @@ def main() -> None:
             "device": "cuda",
             "low_cpu_mem_usage": True,
             "trust_remote_code": True,
+            "tokenizer_class": "GPT2Tokenizer",
         }
         base_output = f"tmp/routerinterp/flex/{label}"
         sae_fit_config = {
@@ -101,6 +102,7 @@ def main() -> None:
             eval_config["examples_glob"] = source["eval_glob"]
         analysis_config = {
             "project_root": str(project_root),
+            "model_label": label,
             "train_artifacts_path": f"{base_output}/probe_fit",
             "eval_artifacts_path": f"{base_output}/eval",
             "pretrained_sae_dir": f"{base_output}/streamed_sae",
@@ -134,6 +136,7 @@ def main() -> None:
             "project_root": str(project_root),
             "batch_name": batch_name,
             "continue_on_error": bool(matrix.get("continue_on_error", True)),
+            "dataset_config_path": source.get("dataset_config_path"),
             "jobs": jobs,
         },
     )

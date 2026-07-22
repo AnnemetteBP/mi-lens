@@ -10,7 +10,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -27,6 +26,44 @@ _PARQUET_CONVERSION_CONFIGS = {
     "allenai/social_i_qa": "default",
     "google-research-datasets/mbpp": "full",
 }
+
+
+# Keep the runtime RouterInterp pipeline independent of a local FlexEval clone.
+# These are the official source IDs used by EuroEval's Danish configurations.
+_EUROEVAL_DANISH_SOURCES = {
+    "angry-tweets": "EuroEval/angry-tweets-mini",
+    "scala-da": "EuroEval/scala-da",
+    "dansk": "EuroEval/dansk-mini",
+    "multi-wiki-qa-da": "EuroEval/multi-wiki-qa-da-mini",
+    "nordjylland-news": "EuroEval/nordjylland-news-mini",
+    "danske-talemaader": "EuroEval/danske-talemaader",
+    "danish-citizen-tests": "EuroEval/danish-citizen-tests-updated",
+    "hellaswag-da": "EuroEval/hellaswag-da-mini",
+    "ifeval-da": "EuroEval/ifeval-da",
+    "valeu-da": "EuroEval/european-values-da",
+}
+
+_EUROEVAL_DANISH_PROMPTS = {
+    "angry-tweets": ("Dokument: {text}\nSentiment: {label}", ("positiv", "neutral", "negativ")),
+    "scala-da": ("Sætning: {text}\nGrammatisk korrekt: {label}", ("ja", "nej")),
+    "dansk": ("Sætning: {text}\nNavngivne entiteter:", ()),
+    "multi-wiki-qa-da": ("Tekst: {text}\nSpørgsmål: {question}\nSvar med maks. 3 ord: {label}", ()),
+    "nordjylland-news": ("Dokument: {text}\nResumé: {target_text}", ()),
+    "danske-talemaader": ("Spørgsmål: {text}\nSvar: {label}", ("a", "b", "c", "d")),
+    "danish-citizen-tests": ("Spørgsmål: {text}\nSvar: {label}", ("a", "b", "c", "d")),
+    "hellaswag-da": ("Spørgsmål: {text}\nSvar: {label}", ("a", "b", "c", "d")),
+    "ifeval-da": ("Opgave: {text}\nSvar:", ()),
+    "valeu-da": ("Spørgsmål: {text}\nSvar: {label}", ()),
+}
+
+
+@dataclass(frozen=True, slots=True)
+class _EuroEvalFallbackConfig:
+    prompt_template: str
+    labels: tuple[str, ...]
+
+    def get_labels_str(self) -> str:
+        return ", ".join(self.labels)
 
 
 @dataclass(slots=True)
@@ -99,41 +136,22 @@ def _configure_hf_cache(cache_dir: Path) -> None:
 
 
 def _load_euroeval_dataset(spec: RouterDatasetExportSpec, cache_dir: Path):
-    """Load a Danish EuroEval split through the vendored EuroEval definitions."""
+    """Load an official Danish EuroEval source without importing FlexEval."""
 
-    project_root = cache_dir.parents[1]
-    euroeval_src = project_root / "FlexEval" / "EuroEval" / "src"
-    if not euroeval_src.is_dir():
-        raise FileNotFoundError(f"Missing vendored EuroEval source at {euroeval_src}.")
-    if str(euroeval_src) not in sys.path:
-        sys.path.insert(0, str(euroeval_src))
-    from euroeval.data_loading import load_raw_data
-    from euroeval.data_models import DatasetConfig
-    from euroeval.dataset_configs import danish
-
-    config = next(
-        (
-            value
-            for value in vars(danish).values()
-            if isinstance(value, DatasetConfig) and value.name == spec.dataset_name
-        ),
-        None,
-    )
-    if config is None:
-        raise KeyError(f"Unknown vendored EuroEval Danish dataset {spec.dataset_name!r}.")
-    dataset = load_raw_data(
-        config,
+    try:
+        source = _EUROEVAL_DANISH_SOURCES[spec.dataset_name]
+        prompt_template, labels = _EUROEVAL_DANISH_PROMPTS[spec.dataset_name]
+    except KeyError as exc:
+        raise KeyError(f"Unknown EuroEval Danish dataset {spec.dataset_name!r}.") from exc
+    # This provider is deliberately local to mi-lens. UCloud needs only the
+    # authenticated Hub endpoint; no FlexEval checkout or package is imported.
+    dataset = load_dataset(
+        source,
+        split=spec.split,
         cache_dir=str(cache_dir),
-        api_key=os.environ.get("HF_TOKEN"),
+        token=os.environ.get("HF_TOKEN"),
     )
-    if config.preprocessing_func is not None:
-        dataset = config.preprocessing_func(dataset)
-    if spec.split not in dataset:
-        raise ValueError(
-            f"EuroEval dataset {spec.dataset_name!r} has no {spec.split!r} split; "
-            f"available splits: {sorted(dataset)}."
-        )
-    return dataset[spec.split], config
+    return dataset, _EuroEvalFallbackConfig(prompt_template=prompt_template, labels=labels)
 
 
 def _load_router_dataset(spec: RouterDatasetExportSpec, cache_dir: Path):
@@ -149,6 +167,7 @@ def _load_router_dataset(spec: RouterDatasetExportSpec, cache_dir: Path):
             data_files={spec.split: spec.data_file},
             split=spec.split,
             cache_dir=str(cache_dir),
+            token=os.environ.get("HF_TOKEN"),
         ), None
 
     conversion_config = _PARQUET_CONVERSION_CONFIGS.get(spec.dataset_name)
@@ -159,6 +178,7 @@ def _load_router_dataset(spec: RouterDatasetExportSpec, cache_dir: Path):
             split=spec.split,
             revision=spec.revision,
             cache_dir=str(cache_dir),
+            token=os.environ.get("HF_TOKEN"),
         ), None
 
     config_name = spec.config_name or conversion_config
@@ -171,6 +191,7 @@ def _load_router_dataset(spec: RouterDatasetExportSpec, cache_dir: Path):
         data_files={spec.split: data_file},
         split=spec.split,
         cache_dir=str(cache_dir),
+        token=os.environ.get("HF_TOKEN"),
     ), None
 
 
@@ -532,3 +553,63 @@ def iter_router_records_from_config(config_path: str | Path, *, project_root: st
                 emitted += 1
             if spec.max_records is not None and emitted >= spec.max_records:
                 break
+
+
+def warm_router_dataset_cache_from_config(
+    config_path: str | Path,
+    *,
+    project_root: str | Path,
+    roles: tuple[str, ...] = ("sae_fit", "eval"),
+) -> dict[str, Any]:
+    """Download/open all configured source datasets before loading any model.
+
+    Dataset Arrow/Parquet files stay in ``tmp/hf_cache``. This records only a
+    compact manifest and deliberately does not export prompt JSONL files.
+    """
+
+    config_path = Path(config_path)
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    paths = router_data_paths(project_root)
+    _configure_hf_cache(paths.cache_dir)
+    datasets_info: list[dict[str, Any]] = []
+    for role in roles:
+        for raw_spec in config.get(role, []):
+            if not raw_spec.get("enabled", True):
+                continue
+            values = dict(raw_spec)
+            values.pop("enabled", None)
+            values["role"] = role
+            values["output_path"] = paths.data_root / ".streaming_unused.jsonl"
+            spec = RouterDatasetExportSpec(**values)
+            dataset, euroeval_config = _load_router_dataset(spec, paths.cache_dir)
+            first_row: dict[str, Any] | None = None
+            for source_idx in range(max(0, int(spec.start_idx)), len(dataset)):
+                item = dict(dataset[source_idx])
+                if _matches_spec(spec, item):
+                    first_row = _build_row(
+                        spec,
+                        item,
+                        source_idx,
+                        euroeval_config=euroeval_config,
+                    )
+                    break
+            if first_row is None or not first_row["prompt"]:
+                raise ValueError(
+                    f"{spec.name}: source loaded but no valid prompt could be built "
+                    f"from {spec.dataset_name!r} split {spec.split!r}."
+                )
+            datasets_info.append(
+                {
+                    "role": role,
+                    "name": spec.name,
+                    "dataset": spec.dataset_name,
+                    "split": spec.split,
+                    "source_records": len(dataset),
+                    "validated_prompt_characters": len(str(first_row["prompt"])),
+                }
+            )
+    return {
+        "dataset_config_path": str(config_path),
+        "cache_dir": str(paths.cache_dir),
+        "datasets": datasets_info,
+    }

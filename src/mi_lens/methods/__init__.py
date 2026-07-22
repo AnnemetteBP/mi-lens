@@ -48,6 +48,7 @@ from .router_data_prep import (
     export_router_dataset_to_jsonl,
     prepare_router_datasets_from_config,
     router_data_paths,
+    warm_router_dataset_cache_from_config,
 )
 from .tokenization_audit import (
     TokenAuditConfig,
@@ -99,4 +100,5 @@ __all__ = [
     "export_router_dataset_to_jsonl",
     "prepare_router_datasets_from_config",
     "router_data_paths",
+    "warm_router_dataset_cache_from_config",
 ]

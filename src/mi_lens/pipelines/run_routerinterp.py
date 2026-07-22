@@ -15,6 +15,7 @@ from mi_lens.sparse import (
     TopKSAE,
     capture_flexolmo_router_layers,
     capture_routerinterp_prompt_artifacts,
+    feature_activation_diagnostics,
     feature_coactivation_ratio,
     fit_routing_probe,
     fit_topk_sae,
@@ -102,8 +103,9 @@ def run_routerinterp_streaming_sae_fit_pipeline(config: dict[str, Any]) -> dict[
         raise ValueError("max_sae_fit_tokens and sae.batch_size must be positive.")
     try:
         requested_layers = config["layers"]
+        model_layers = list(iter_flex_olmo_layers(model))
         if requested_layers == "routerinterp_quartiles":
-            layer_count = len(iter_flex_olmo_layers(model))
+            layer_count = len(model_layers)
             layers = tuple((index + 1) * layer_count // 4 - 1 for index in range(4))
         else:
             layers = tuple(int(layer) for layer in requested_layers)
@@ -178,6 +180,10 @@ def run_routerinterp_streaming_sae_fit_pipeline(config: dict[str, Any]) -> dict[
             layer_dir = output_dir / f"layer_{layer:02d}"
             layer_dir.mkdir(parents=True, exist_ok=True)
             sae.eval().save_pretrained(str(layer_dir / "topk_sae.pt"))
+            gate_weight = model_layers[layer].mlp.gate.weight.detach().cpu().float()
+            if gate_weight.ndim != 2 or gate_weight.shape[1] != sae.config.d_model:
+                raise ValueError(f"Layer {layer} gate weights are incompatible with its SAE input width.")
+            torch.save({"router_weight": gate_weight}, layer_dir / "router_geometry.pt")
         manifest = {
             "format": "mi_lens.routerinterp.streaming_sae.v1",
             "trained_tokens_per_layer": trained_tokens,
@@ -223,6 +229,12 @@ def run_routerinterp_capture_pipeline(config: dict[str, Any]) -> dict[str, Any]:
     if config.get("max_examples") is not None:
         records = records[: int(config["max_examples"])]
     model, tokenizer, cache_dir = load_model_and_tokenizer(model_config, project_root=project_root)
+    tokenizer_provenance = {
+        "tokenizer_class_loaded": type(tokenizer).__name__,
+        "tokenizer_name_or_path": str(getattr(tokenizer, "name_or_path", "")),
+        "tokenizer_is_fast": bool(getattr(tokenizer, "is_fast", False)),
+        "tokenizer_vocab_size": int(getattr(tokenizer, "vocab_size", 0)),
+    }
     model.eval()
     try:
         requested_layers = config["layers"]
@@ -263,6 +275,7 @@ def run_routerinterp_capture_pipeline(config: dict[str, Any]) -> dict[str, Any]:
                     "examples_paths": [str(path) for path in example_paths],
                     "dataset_split_role": config.get("dataset_split_role", "train"),
                     "layers": list(capture_config.layers),
+                    **tokenizer_provenance,
                 },
             ),
             "manifest_path": str(output_dir / "manifest.json"),
@@ -283,14 +296,16 @@ def _load_layer_tokens(
     *,
     layer: int,
     max_tokens: int | None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[str], int, int]:
     """Read an explicit token cap from per-prompt artifacts in manifest order."""
 
     manifest = json.loads((artifact_dir / "manifest.json").read_text(encoding="utf-8"))
     activations: list[torch.Tensor] = []
     selected: list[torch.Tensor] = []
+    router_probabilities: list[torch.Tensor] = []
     token_ids: list[torch.Tensor] = []
     previous_token_ids: list[torch.Tensor] = []
+    domains: list[str] = []
     retained = 0
     num_experts: int | None = None
     for row in manifest["prompts"]:
@@ -322,12 +337,14 @@ def _load_layer_tokens(
             remaining = max_tokens - retained
             if remaining <= 0:
                 break
-            x, y = x[:remaining], y[:remaining]
+            x, y, probabilities = x[:remaining], y[:remaining], probabilities[:remaining]
             source_ids, previous_ids = source_ids[:remaining], previous_ids[:remaining]
         activations.append(x)
         selected.append(y)
+        router_probabilities.append(probabilities.float())
         token_ids.append(source_ids)
         previous_token_ids.append(previous_ids)
+        domains.extend([str(payload.get("domain", "unknown"))] * x.shape[0])
         retained += x.shape[0]
     if not activations:
         raise ValueError(f"No tokens available for layer {layer} in {artifact_dir}.")
@@ -335,11 +352,272 @@ def _load_layer_tokens(
     return (
         torch.cat(activations),
         torch.cat(selected),
+        torch.cat(router_probabilities),
         torch.cat(token_ids),
         torch.cat(previous_token_ids),
+        domains,
         retained,
         num_experts,
     )
+
+
+def _load_token_provenance(
+    artifact_dir: Path,
+    *,
+    max_tokens: int | None,
+) -> tuple[list[dict[str, Any]], torch.Tensor, torch.Tensor]:
+    """Keep lightweight prompt provenance aligned with flattened token rows.
+
+    Activations remain in the regular tensors.  This helper stores only the
+    information needed to inspect the handful of held-out contexts selected by
+    a top-rho feature later in the analysis.
+    """
+
+    manifest = json.loads((artifact_dir / "manifest.json").read_text(encoding="utf-8"))
+    prompts: list[dict[str, Any]] = []
+    prompt_rows: list[torch.Tensor] = []
+    token_positions: list[torch.Tensor] = []
+    retained = 0
+    for row in manifest["prompts"]:
+        if max_tokens is not None and retained >= max_tokens:
+            break
+        payload = torch.load(artifact_dir / row["path"], map_location="cpu", weights_only=True)
+        positions = payload["positions"].long()
+        if max_tokens is not None:
+            positions = positions[: max_tokens - retained]
+        if not len(positions):
+            continue
+        prompt_index = len(prompts)
+        prompts.append(
+            {
+                "example_id": str(payload.get("example_id", row.get("example_id", prompt_index))),
+                "dataset_name": str(payload.get("dataset_name", row.get("dataset_name", "unknown"))),
+                "task": str(payload.get("task", row.get("task", "unknown"))),
+                "domain": str(payload.get("domain", row.get("domain", "unknown"))),
+                "language": str(payload.get("language", row.get("language", "unknown"))),
+                "prompt": str(payload.get("prompt", "")),
+                "token_ids": payload["token_ids"].long(),
+            }
+        )
+        prompt_rows.append(torch.full((len(positions),), prompt_index, dtype=torch.long))
+        token_positions.append(positions)
+        retained += len(positions)
+    if not prompt_rows:
+        raise ValueError(f"No token provenance found in {artifact_dir}.")
+    return prompts, torch.cat(prompt_rows), torch.cat(token_positions)
+
+
+def _top_rho_feature_contexts(
+    *,
+    features: torch.Tensor,
+    rho_indices: torch.Tensor,
+    rho_values: torch.Tensor,
+    expert_labels: list[str],
+    prompt_records: list[dict[str, Any]],
+    prompt_rows: torch.Tensor,
+    token_positions: torch.Tensor,
+    max_contexts_per_feature: int,
+) -> list[dict[str, Any]]:
+    """Save actual held-out contexts for the most routing-useful SAE latents."""
+
+    if features.shape[0] != prompt_rows.numel() or features.shape[0] != token_positions.numel():
+        raise ValueError("Feature activations and token provenance are not aligned.")
+    rows: list[dict[str, Any]] = []
+    for expert in range(rho_indices.shape[0]):
+        for rank, feature_id_tensor in enumerate(rho_indices[expert]):
+            feature_id = int(feature_id_tensor.item())
+            activations = features[:, feature_id]
+            count = min(max_contexts_per_feature, activations.numel())
+            values, indices = activations.topk(k=count)
+            for context_rank, (value, token_row) in enumerate(zip(values.tolist(), indices.tolist()), start=1):
+                prompt = prompt_records[int(prompt_rows[token_row].item())]
+                token_position = int(token_positions[token_row].item())
+                token_ids = prompt["token_ids"]
+                rows.append(
+                    {
+                        "expert": expert,
+                        "expert_label": expert_labels[expert] if expert_labels else f"expert_{expert}",
+                        "feature_id": feature_id,
+                        "rho_rank": rank + 1,
+                        "rho": float(rho_values[expert, rank].item()),
+                        "context_rank": context_rank,
+                        "activation": float(value),
+                        "example_id": prompt["example_id"],
+                        "dataset_name": prompt["dataset_name"],
+                        "task": prompt["task"],
+                        "domain": prompt["domain"],
+                        "language": prompt["language"],
+                        "token_position": token_position,
+                        "token_id": int(token_ids[token_position].item()),
+                        "previous_token_id": int(token_ids[token_position - 1].item()) if token_position else None,
+                        # The source text is retained for manual feature interpretation;
+                        # it is never presented as an automatic semantic explanation.
+                        "prompt": prompt["prompt"],
+                    }
+                )
+    return rows
+
+
+def _top_rho_feature_domain_profiles(
+    *,
+    features: torch.Tensor,
+    domains: list[str],
+    rho_indices: torch.Tensor,
+    rho_values: torch.Tensor,
+    expert_labels: list[str],
+) -> list[dict[str, Any]]:
+    """Describe top-rho latent firing across observed dataset domains only."""
+
+    if features.shape[0] != len(domains):
+        raise ValueError("Feature activations and domain labels are not aligned.")
+    domain_names = sorted(set(domains))
+    rows: list[dict[str, Any]] = []
+    for expert in range(rho_indices.shape[0]):
+        for rank, feature_id_tensor in enumerate(rho_indices[expert]):
+            feature_id = int(feature_id_tensor.item())
+            activations = features[:, feature_id]
+            masses = []
+            means: dict[str, float] = {}
+            for domain in domain_names:
+                mask = torch.tensor([value == domain for value in domains], device=features.device)
+                domain_activations = activations[mask]
+                masses.append(domain_activations.sum())
+                means[domain] = float(domain_activations.mean().item()) if domain_activations.numel() else 0.0
+            mass_tensor = torch.stack(masses)
+            shares = mass_tensor / mass_tensor.sum().clamp_min(1e-8)
+            positive = shares[shares > 0]
+            entropy = (
+                float((-(positive * positive.log()).sum() / math.log(len(domain_names))).item())
+                if len(domain_names) > 1 and positive.numel()
+                else 0.0
+            )
+            for domain_index, domain in enumerate(domain_names):
+                rows.append(
+                    {
+                        "expert": expert,
+                        "expert_label": expert_labels[expert] if expert_labels else f"expert_{expert}",
+                        "feature_id": feature_id,
+                        "rho_rank": rank + 1,
+                        "rho": float(rho_values[expert, rank].item()),
+                        "domain": domain,
+                        "mean_activation": means[domain],
+                        "activation_mass_share": float(shares[domain_index].item()),
+                        "normalized_domain_entropy": entropy,
+                    }
+                )
+    return rows
+
+
+def _average_ranks(values: torch.Tensor) -> torch.Tensor:
+    """Return average ranks while handling ties without a SciPy dependency."""
+
+    if values.ndim != 1:
+        raise ValueError("Ranks require a one-dimensional tensor.")
+    order = torch.argsort(values)
+    sorted_values = values[order]
+    ranks = torch.empty_like(values, dtype=torch.float32)
+    start = 0
+    while start < values.numel():
+        end = start + 1
+        while end < values.numel() and bool(sorted_values[end] == sorted_values[start]):
+            end += 1
+        ranks[order[start:end]] = (start + 1 + end) / 2.0
+        start = end
+    return ranks
+
+
+def _spearman_correlation(left: torch.Tensor, right: torch.Tensor) -> float | None:
+    """Rank correlation, returning ``None`` for a constant vector."""
+
+    if left.shape != right.shape or left.ndim != 1:
+        raise ValueError("Spearman correlation requires equally shaped vectors.")
+    left_ranks = _average_ranks(left.float())
+    right_ranks = _average_ranks(right.float())
+    left_centered = left_ranks - left_ranks.mean()
+    right_centered = right_ranks - right_ranks.mean()
+    denominator = left_centered.norm() * right_centered.norm()
+    if float(denominator.item()) == 0.0:
+        return None
+    return float((left_centered @ right_centered / denominator).item())
+
+
+def _router_geometry_agreement(
+    *,
+    sae: TopKSAE,
+    rho: torch.Tensor,
+    router_weights: torch.Tensor,
+    top_n: int,
+) -> list[dict[str, float | int | list[int] | None]]:
+    """Compare rho-based feature selection with router-weight geometry."""
+
+    decoder_directions = sae.decoder.weight.detach().float().T
+    if router_weights.ndim != 2 or router_weights.shape[1] != decoder_directions.shape[1]:
+        raise ValueError("Router weights and SAE decoder directions have incompatible widths.")
+    if router_weights.shape[0] != rho.shape[0]:
+        raise ValueError("Router weight rows do not match the router expert count.")
+    normalized_router = router_weights / router_weights.norm(dim=1, keepdim=True).clamp_min(1e-8)
+    normalized_decoder = decoder_directions / decoder_directions.norm(dim=1, keepdim=True).clamp_min(1e-8)
+    cosine_scores = normalized_router @ normalized_decoder.T
+    output = []
+    for expert in range(rho.shape[0]):
+        rho_top = rho[expert].topk(k=min(top_n, rho.shape[1])).indices
+        cosine_top = cosine_scores[expert].topk(k=min(top_n, cosine_scores.shape[1])).indices
+        overlap = set(rho_top.cpu().tolist()) & set(cosine_top.cpu().tolist())
+        union = set(rho_top.cpu().tolist()) | set(cosine_top.cpu().tolist())
+        output.append(
+            {
+                "expert": expert,
+                "spearman_rho_vs_router_cosine": _spearman_correlation(rho[expert], cosine_scores[expert]),
+                "top_feature_overlap_count": len(overlap),
+                "top_feature_jaccard": float(len(overlap) / len(union)) if union else 1.0,
+                "rho_feature_ids": rho_top.cpu().tolist(),
+                "router_cosine_feature_ids": cosine_top.cpu().tolist(),
+            }
+        )
+    return output
+
+
+def _domain_routing_summary(
+    selected_experts: torch.Tensor,
+    domains: list[str],
+    *,
+    num_experts: int,
+) -> dict[str, Any]:
+    """Compare each expert's dataset-domain mix with the corpus-wide mix."""
+
+    if len(domains) != selected_experts.shape[0]:
+        raise ValueError("Each routed token must retain one domain label.")
+    names = sorted(set(domains))
+    index = {name: value for value, name in enumerate(names)}
+    domain_ids = torch.tensor([index[name] for name in domains], dtype=torch.long)
+    token_counts = torch.bincount(domain_ids, minlength=len(names)).float()
+    corpus_distribution = token_counts / token_counts.sum().clamp_min(1)
+
+    def normalized_entropy(probabilities: torch.Tensor) -> float:
+        if probabilities.numel() < 2:
+            return 0.0
+        positive = probabilities[probabilities > 0]
+        return float((-(positive * positive.log()).sum() / torch.log(torch.tensor(float(probabilities.numel())))).item())
+
+    per_expert = []
+    for expert in range(num_experts):
+        selected = (selected_experts == expert).any(dim=1)
+        counts = torch.bincount(domain_ids[selected], minlength=len(names)).float()
+        probabilities = counts / counts.sum().clamp_min(1)
+        per_expert.append(
+            {
+                "expert": expert,
+                "routed_token_count": int(selected.sum().item()),
+                "normalized_domain_entropy": normalized_entropy(probabilities),
+                "domain_routing_share": {name: float(probabilities[index[name]].item()) for name in names},
+            }
+        )
+    return {
+        "domains": names,
+        "corpus_normalized_entropy": normalized_entropy(corpus_distribution),
+        "corpus_domain_share": {name: float(corpus_distribution[index[name]].item()) for name in names},
+        "per_expert": per_expert,
+    }
 
 
 def _constant_top_k(selected_experts: torch.Tensor, split_name: str) -> int:
@@ -381,14 +659,97 @@ def _predict_ngram_scores(
     return torch.stack(scores)
 
 
-def _probe_metrics(probe, features: torch.Tensor, targets: torch.Tensor, *, top_k: int) -> dict[str, float]:
+def _expected_calibration_error(probabilities: torch.Tensor, targets: torch.Tensor, *, bins: int = 15) -> float:
+    """Binary ECE for independent expert-selection probabilities."""
+
+    if probabilities.shape != targets.shape:
+        raise ValueError("Calibration probabilities and targets must have the same shape.")
+    confidence = probabilities.flatten().clamp(0, 1)
+    outcome = targets.flatten().float()
+    boundaries = torch.linspace(0, 1, bins + 1, device=confidence.device)
+    error = torch.zeros((), device=confidence.device)
+    for index in range(bins):
+        lower, upper = boundaries[index], boundaries[index + 1]
+        membership = (confidence >= lower) & (
+            confidence <= upper if index == bins - 1 else confidence < upper
+        )
+        if membership.any():
+            error += membership.float().mean() * (confidence[membership].mean() - outcome[membership].mean()).abs()
+    return float(error.item())
+
+
+def _router_distribution_metrics(scores: torch.Tensor, actual_probabilities: torch.Tensor) -> dict[str, float]:
+    """Compare a score-derived expert distribution to captured router probabilities."""
+
+    if scores.shape != actual_probabilities.shape:
+        raise ValueError("Router scores and captured probabilities must have the same shape.")
+    if (scores >= 0).all():
+        predicted = scores / scores.sum(-1, keepdim=True).clamp_min(1e-8)
+    else:
+        predicted = torch.softmax(scores, dim=-1)
+    actual = actual_probabilities / actual_probabilities.sum(-1, keepdim=True).clamp_min(1e-8)
+    predicted = predicted.clamp_min(1e-8)
+    actual = actual.clamp_min(1e-8)
+    midpoint = 0.5 * (actual + predicted)
+    kl_actual_predicted = (actual * (actual.log() - predicted.log())).sum(-1).mean()
+    jsd = 0.5 * (
+        (actual * (actual.log() - midpoint.log())).sum(-1)
+        + (predicted * (predicted.log() - midpoint.log())).sum(-1)
+    ).mean()
+    tv = 0.5 * (actual - predicted).abs().sum(-1).mean()
+    return {
+        "kl_actual_to_predicted": float(kl_actual_predicted.item()),
+        "jensen_shannon_divergence": float(jsd.item()),
+        "total_variation_distance": float(tv.item()),
+    }
+
+
+def _routing_prediction_metrics(
+    scores: torch.Tensor,
+    targets: torch.Tensor,
+    actual_probabilities: torch.Tensor,
+    *,
+    top_k: int,
+    include_binary_calibration: bool,
+) -> dict[str, float]:
+    """Held-out agreement with the model's observed routing decisions and weights."""
+
+    predicted = top_k_expert_predictions(scores, top_k=top_k)
+    intersection = (predicted * targets).sum(-1)
+    union = (predicted + targets).clamp_max(1).sum(-1).clamp_min(1)
+    predicted_count = predicted.sum(-1).clamp_min(1)
+    actual_count = targets.sum(-1).clamp_min(1)
+    result = {
+        "set_precision_at_k": float((intersection / predicted_count).mean().item()),
+        "set_recall_at_k": float((intersection / actual_count).mean().item()),
+        "set_jaccard_at_k": float((intersection / union).mean().item()),
+        "macro_f1": macro_f1_expert_routing(predicted, targets),
+        **_router_distribution_metrics(scores, actual_probabilities),
+    }
+    if include_binary_calibration:
+        selection_probabilities = torch.sigmoid(scores)
+        result["selection_brier_score"] = float(((selection_probabilities - targets.float()) ** 2).mean().item())
+        result["selection_ece"] = _expected_calibration_error(selection_probabilities, targets)
+    return result
+
+
+def _probe_metrics(
+    probe,
+    features: torch.Tensor,
+    targets: torch.Tensor,
+    actual_probabilities: torch.Tensor,
+    *,
+    top_k: int,
+) -> dict[str, float]:
     with torch.no_grad():
         scores = probe(features)
-        predicted = top_k_expert_predictions(scores, top_k=top_k)
-    return {
-        "set_recall_at_k": routing_recall(scores, targets, top_k=top_k),
-        "macro_f1": macro_f1_expert_routing(predicted, targets),
-    }
+    return _routing_prediction_metrics(
+        scores,
+        targets,
+        actual_probabilities,
+        top_k=top_k,
+        include_binary_calibration=True,
+    )
 
 
 def _resolve_routerinterp_protocol(config: dict[str, Any], d_model: int) -> dict[str, Any]:
@@ -512,6 +873,7 @@ def run_routerinterp_analysis_pipeline(config: dict[str, Any]) -> dict[str, Any]
     expert_labels = [str(label) for label in config.get("expert_labels", ())]
     results: dict[str, Any] = {
         "format": "mi_lens.routerinterp.analysis.v1",
+        "model_label": str(config.get("model_label", "")),
         "expert_labels": expert_labels,
         "layers": {},
     }
@@ -520,8 +882,10 @@ def run_routerinterp_analysis_pipeline(config: dict[str, Any]) -> dict[str, Any]
         (
             train_x,
             train_selected,
+            train_router_probabilities,
             train_token_ids,
             train_previous_token_ids,
+            _train_domains,
             train_token_count,
             train_num_experts,
         ) = _load_layer_tokens(
@@ -532,8 +896,10 @@ def run_routerinterp_analysis_pipeline(config: dict[str, Any]) -> dict[str, Any]
         (
             eval_x,
             eval_selected,
+            eval_router_probabilities,
             eval_token_ids,
             eval_previous_token_ids,
+            eval_domains,
             eval_token_count,
             eval_num_experts,
         ) = _load_layer_tokens(
@@ -584,6 +950,7 @@ def run_routerinterp_analysis_pipeline(config: dict[str, Any]) -> dict[str, Any]
         retained_train_tokens = probe_fit_tokens if pretrained_sae_dir else sae_fit_tokens
         train_x = train_x[:retained_train_tokens]
         train_selected = train_selected[:retained_train_tokens]
+        train_router_probabilities = train_router_probabilities[:retained_train_tokens]
         train_token_ids = train_token_ids[:retained_train_tokens]
         train_previous_token_ids = train_previous_token_ids[:retained_train_tokens]
         train_token_count = retained_train_tokens
@@ -592,6 +959,8 @@ def run_routerinterp_analysis_pipeline(config: dict[str, Any]) -> dict[str, Any]
         eval_x = eval_x.to(device)
         train_targets = selected_expert_targets(train_selected.to(device), n_experts)
         eval_targets = selected_expert_targets(eval_selected.to(device), n_experts)
+        train_router_probabilities = train_router_probabilities.to(device)
+        eval_router_probabilities = eval_router_probabilities.to(device)
         sae_settings = protocol["sae"]
         sae_training_settings = {
             "steps": int(sae_settings.get("steps", 10_000)),
@@ -644,16 +1013,20 @@ def run_routerinterp_analysis_pipeline(config: dict[str, Any]) -> dict[str, Any]
         bigram_counts, _ = _fit_ngram_counts(bigram_train_keys, probe_train_targets.cpu())
         unigram_scores = _predict_ngram_scores(eval_token_ids, unigram_counts, global_counts).to(device)
         bigram_scores = _predict_ngram_scores(bigram_eval_keys, bigram_counts, global_counts).to(device)
-        unigram_predictions = top_k_expert_predictions(unigram_scores, top_k=eval_top_k)
-        bigram_predictions = top_k_expert_predictions(bigram_scores, top_k=eval_top_k)
-        unigram_metrics = {
-            "set_recall_at_k": routing_recall(unigram_scores, eval_targets, top_k=eval_top_k),
-            "macro_f1": macro_f1_expert_routing(unigram_predictions, eval_targets),
-        }
-        bigram_metrics = {
-            "set_recall_at_k": routing_recall(bigram_scores, eval_targets, top_k=eval_top_k),
-            "macro_f1": macro_f1_expert_routing(bigram_predictions, eval_targets),
-        }
+        unigram_metrics = _routing_prediction_metrics(
+            unigram_scores,
+            eval_targets,
+            eval_router_probabilities,
+            top_k=eval_top_k,
+            include_binary_calibration=False,
+        )
+        bigram_metrics = _routing_prediction_metrics(
+            bigram_scores,
+            eval_targets,
+            eval_router_probabilities,
+            top_k=eval_top_k,
+            include_binary_calibration=False,
+        )
 
         active_feature_counts = [int(value) for value in protocol["active_feature_counts"]]
         if any(value < 1 or value > sae_config.k for value in active_feature_counts):
@@ -679,7 +1052,7 @@ def run_routerinterp_analysis_pipeline(config: dict[str, Any]) -> dict[str, Any]
                 learning_rate=float(probe_settings.get("learning_rate", 1e-3)),
             )
             sae_by_active_features[str(active_features)] = _probe_metrics(
-                probe, sparse_sae_eval, eval_targets, top_k=eval_top_k
+                probe, sparse_sae_eval, eval_targets, eval_router_probabilities, top_k=eval_top_k
             )
             if active_features == primary_active_features:
                 primary_sae_probe = probe
@@ -695,7 +1068,7 @@ def run_routerinterp_analysis_pipeline(config: dict[str, Any]) -> dict[str, Any]
                 learning_rate=float(probe_settings.get("learning_rate", 1e-3)),
             )
             neuron_by_active_features[str(active_features)] = _probe_metrics(
-                neuron_probe, sparse_neuron_eval, eval_targets, top_k=eval_top_k
+                neuron_probe, sparse_neuron_eval, eval_targets, eval_router_probabilities, top_k=eval_top_k
             )
 
             sparse_pca_train = sparse_by_magnitude(pca_train, k=active_features)
@@ -707,10 +1080,26 @@ def run_routerinterp_analysis_pipeline(config: dict[str, Any]) -> dict[str, Any]
                 learning_rate=float(probe_settings.get("learning_rate", 1e-3)),
             )
             pca_by_active_features[str(active_features)] = _probe_metrics(
-                pca_probe, sparse_pca_eval, eval_targets, top_k=eval_top_k
+                pca_probe, sparse_pca_eval, eval_targets, eval_router_probabilities, top_k=eval_top_k
             )
         assert primary_sae_probe is not None
         coactivation = feature_coactivation_ratio(eval_features, rho_indices)
+        activation_diagnostics = feature_activation_diagnostics(eval_features)
+        domain_routing = _domain_routing_summary(
+            eval_selected,
+            eval_domains,
+            num_experts=n_experts,
+        )
+        geometry_path = pretrained_root / f"layer_{layer:02d}" / "router_geometry.pt" if pretrained_sae_dir else None
+        router_geometry = None
+        if geometry_path is not None and geometry_path.is_file():
+            geometry_payload = torch.load(geometry_path, map_location="cpu", weights_only=True)
+            router_geometry = _router_geometry_agreement(
+                sae=sae,
+                rho=rho.cpu(),
+                router_weights=geometry_payload["router_weight"],
+                top_n=top_rho_count,
+            )
 
         layer_dir = output_dir / f"layer_{layer:02d}"
         layer_dir.mkdir(parents=True, exist_ok=True)
@@ -759,6 +1148,9 @@ def run_routerinterp_analysis_pipeline(config: dict[str, Any]) -> dict[str, Any]
             },
             "final_train_loss": loss_history[-1] if loss_history else None,
             "feature_coactivation": coactivation,
+            "feature_activation_diagnostics": activation_diagnostics,
+            "domain_routing": domain_routing,
+            "rho_router_geometry_agreement": router_geometry,
             "top_rho_features": [
                 {
                     "expert": expert,
