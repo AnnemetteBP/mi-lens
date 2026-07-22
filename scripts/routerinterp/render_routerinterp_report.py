@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import sys
 from pathlib import Path
@@ -27,10 +28,31 @@ def _project_tmp_path(value: str) -> Path:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--summary", action="append", required=True, help="RouterInterp analysis summary.json; repeat for models.")
+    parser.add_argument("--summary", action="append", help="RouterInterp analysis summary.json; repeat for models.")
+    parser.add_argument(
+        "--summary-glob",
+        action="append",
+        help="Glob for RouterInterp summaries relative to the project root; repeat if needed.",
+    )
     parser.add_argument("--output", required=True, help="Relative path under project tmp/ for report artifacts.")
     args = parser.parse_args()
-    summary_paths = [_project_tmp_path(value) for value in args.summary]
+    if not args.summary and not args.summary_glob:
+        parser.error("provide at least one --summary or --summary-glob")
+
+    summary_values = list(args.summary or [])
+    for pattern in args.summary_glob or []:
+        pattern_path = Path(pattern)
+        resolved_pattern = str(pattern_path if pattern_path.is_absolute() else ROOT / pattern_path)
+        matches = sorted(glob.glob(resolved_pattern))
+        if not matches:
+            parser.error(f"--summary-glob matched no files: {pattern}")
+        summary_values.extend(matches)
+
+    summary_paths = []
+    for value in summary_values:
+        path = _project_tmp_path(value)
+        if path not in summary_paths:
+            summary_paths.append(path)
     for path in summary_paths:
         if not path.is_file():
             raise FileNotFoundError(f"Missing RouterInterp summary: {path}")
