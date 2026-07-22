@@ -1,0 +1,39 @@
+{
+  "project_root": ".",
+  "model_label": "flexdanish_8x7b_a4_55b_v2",
+  "model": {
+    "model_name": "FlexOlmo-8x7B-1T-a4-55B-v2",
+    "dtype": "bfloat16",
+    "device": "cuda",
+    "trust_remote_code": false,
+    "low_cpu_mem_usage": true,
+    "tokenizer_class": "GPT2Tokenizer",
+    "use_fast_tokenizer": false
+  },
+  "examples_paths": [
+    "data/router/eval/gsm8k_en_test.jsonl",
+    "data/router/eval/hellaswag_en_validation.jsonl",
+    "data/router/eval/mbpp_en_test.jsonl",
+    "data/router/eval/mmlu_pro_biology_en_test.jsonl",
+    "data/router/eval/muse_news_en_validation.jsonl",
+    "data/router/eval/poetry_en_train_slice.jsonl",
+    "data/router/eval/social_iqa_en_validation.jsonl",
+    "data/router/eval/nordjylland_news_da_test.jsonl"
+  ],
+  "output_dir": "outputs/flexlens",
+  "layers": [5, 11, 18, 24, 31],
+  "max_seq_len": 2048,
+  "skip_first_token": false,
+  "top_k": 8,
+  "save_prompt_artifacts": true,
+  "expert_labels": [
+    "public",
+    "code",
+    "creative",
+    "math",
+    "news",
+    "academic",
+    "reddit",
+    "danish"
+  ]
+}

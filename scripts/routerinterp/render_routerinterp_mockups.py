@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import random
 import sys
 from pathlib import Path
 
@@ -554,6 +556,255 @@ def _model_summary_mockups(output_dir: Path) -> list[str]:
     return paths
 
 
+def _a4_routing_landscape_mockup(output_dir: Path) -> list[str]:
+    """Render one synthetic layout preview for the matched A4 comparison."""
+
+    rng = random.Random(20260722)
+    domains = {
+        "Code": (-2.0, 1.7),
+        "Math": (1.7, 1.7),
+        "News": (-2.0, -1.6),
+        "Academic": (1.8, -1.5),
+        "Danish QA": (-0.1, 0.35),
+        "Danish news": (0.35, -0.75),
+    }
+    domain_colors = {
+        "Code": "#297A8E",
+        "Math": "#D46A3A",
+        "News": "#5A9A67",
+        "Academic": "#8165A5",
+        "Danish QA": "#B75378",
+        "Danish news": "#C79B32",
+    }
+    expert_labels = ["Public", "Code", "Creative", "Math", "News", "Academic", "Reddit", "Danish"]
+    expert_colors = ["#5B6F7A", "#287F8C", "#A76F3D", "#4C8F62", "#B85C76", "#755A9D", "#C69036", "#063F59"]
+
+    def discrete_colorscale(colors: list[str]) -> list[list[object]]:
+        return [
+            point
+            for index, color in enumerate(colors)
+            for point in ([index / len(colors), color], [(index + 1) / len(colors), color])
+        ]
+
+    points: list[tuple[float, float, str, int]] = []
+    for domain_index, (domain, (center_x, center_y)) in enumerate(domains.items()):
+        for cluster_index in range(3):
+            angle = 2.1 * cluster_index + 0.4 * domain_index
+            cluster_x = center_x + 0.44 * math.cos(angle)
+            cluster_y = center_y + 0.38 * math.sin(angle)
+            for _ in range(24):
+                points.append((
+                    cluster_x + rng.gauss(0, 0.16),
+                    cluster_y + rng.gauss(0, 0.14),
+                    domain,
+                    cluster_index,
+                ))
+
+    def route(point: tuple[float, float, str, int], variant: str) -> int:
+        x, y, domain, microdomain = point
+        del x, y
+        base = {
+            "Code": [1, 6, 0],
+            "Math": [3, 0, 5],
+            "News": [4, 0, 6],
+            "Academic": [5, 3, 0],
+            "Danish QA": [5, 0, 3],
+            "Danish news": [4, 0, 5],
+        }[domain][microdomain]
+        if variant == "flexolmo":
+            return base
+        if domain == "Danish QA" and microdomain in {0, 2}:
+            return 7
+        if domain == "Danish news" and microdomain == 1:
+            return 7
+        if variant == "flexdanish_rt" and domain.startswith("Danish") and microdomain != 1:
+            return 7
+        return base
+
+    def region_expert(x: float, y: float, variant: str) -> int:
+        distances = [((x - point[0]) ** 2 + (y - point[1]) ** 2, route(point, variant)) for point in points]
+        nearest = sorted(distances, key=lambda item: item[0])[:15]
+        counts = [0] * len(expert_labels)
+        for _, expert in nearest:
+            counts[expert] += 1
+        return max(range(len(counts)), key=lambda expert: counts[expert])
+
+    domain_names = list(domains)
+
+    def region_domain(x: float, y: float) -> int:
+        distances = [
+            ((x - point[0]) ** 2 + (y - point[1]) ** 2, domain_names.index(point[2]))
+            for point in points
+        ]
+        nearest = sorted(distances, key=lambda item: item[0])[:15]
+        counts = [0] * len(domain_names)
+        for _, domain_id in nearest:
+            counts[domain_id] += 1
+        return max(range(len(counts)), key=lambda domain_id: counts[domain_id])
+
+    axis = [round(-3.0 + 0.1 * index, 3) for index in range(61)]
+    figure = make_subplots(
+        rows=1,
+        cols=4,
+        horizontal_spacing=0.02,
+        shared_yaxes=True,
+        subplot_titles=(
+            "(a) Dataset domains",
+            "(b) FlexOlmo 7x7B-a4",
+            "(c) FlexDanish 8x7B-a4-55B-v2",
+            "(d) FlexDanish 8x7B-a4-55B-v2-RT",
+        ),
+    )
+    domain_region = [[region_domain(x, y) for x in axis] for y in axis]
+    figure.add_trace(
+        go.Heatmap(
+            x=axis,
+            y=axis,
+            z=domain_region,
+            zmin=0,
+            zmax=len(domain_names) - 1,
+            colorscale=discrete_colorscale([domain_colors[domain] for domain in domain_names]),
+            showscale=False,
+            opacity=0.12,
+            hoverinfo="skip",
+        ),
+        row=1,
+        col=1,
+    )
+    for domain, (center_x, center_y) in domains.items():
+        selected = [point for point in points if point[2] == domain]
+        figure.add_trace(
+            go.Scatter(
+                x=[point[0] for point in selected],
+                y=[point[1] for point in selected],
+                mode="markers",
+                name=domain,
+                showlegend=False,
+                marker=dict(size=8, color=domain_colors[domain], opacity=0.74),
+                hovertemplate=f"domain={domain}<extra></extra>",
+            ),
+            row=1,
+            col=1,
+        )
+        figure.add_annotation(
+            x=center_x,
+            y=center_y,
+            text=domain,
+            showarrow=False,
+            font=dict(size=18, family="Arial, sans-serif", weight=600, color=domain_colors[domain]),
+            bgcolor="rgba(252,252,248,0.78)",
+            borderpad=2,
+            row=1,
+            col=1,
+        )
+
+    for col, variant in enumerate(("flexolmo", "flexdanish", "flexdanish_rt"), start=2):
+        region = [[region_expert(x, y, variant) for x in axis] for y in axis]
+        figure.add_trace(
+            go.Heatmap(
+                x=axis,
+                y=axis,
+                z=region,
+                zmin=0,
+                zmax=len(expert_labels) - 1,
+                colorscale=discrete_colorscale(expert_colors),
+                showscale=False,
+                opacity=0.20,
+                hoverinfo="skip",
+            ),
+            row=1,
+            col=col,
+        )
+        for expert_id, expert in enumerate(expert_labels):
+            selected = [point for point in points if route(point, variant) == expert_id]
+            if not selected:
+                continue
+            figure.add_trace(
+                go.Scatter(
+                    x=[point[0] for point in selected],
+                    y=[point[1] for point in selected],
+                    mode="markers",
+                    name=expert,
+                    legendgroup="expert",
+                    showlegend=False,
+                    marker=dict(size=7.5, color=expert_colors[expert_id], opacity=0.84, line=dict(width=0.5, color="#FFFFFF")),
+                    hovertemplate=f"top-1 expert={expert}<extra></extra>",
+                ),
+                row=1,
+                col=col,
+            )
+
+    expert_key = " &nbsp; ".join(
+        f"<span style='color:{color}'>●</span> {label}"
+        for label, color in zip(expert_labels, expert_colors, strict=True)
+    )
+    figure.update_layout(
+        template="plotly_white",
+        title=dict(
+            text=(
+                "<b>A4 Routing Landscapes: Danish Expert Addition and Router Tuning</b>"
+                f"<br><span style='font-size:20px'>Top-1 expert: {expert_key}</span>"
+            ),
+            x=0.5,
+            xanchor="center",
+            y=0.96,
+            yanchor="top",
+            font=dict(size=23, color=INK, family="Arial, sans-serif"),
+        ),
+        font=dict(family="Arial, sans-serif", size=18, color=INK),
+        paper_bgcolor=PAPER_BG,
+        plot_bgcolor=PAPER_BG,
+        showlegend=False,
+        width=1800,
+        height=560,
+        margin=dict(l=88, r=24, t=106, b=82),
+    )
+    figure.update_xaxes(
+        title=None,
+        range=[-3.1, 3.1],
+        showline=True,
+        linecolor="#8BA4AA",
+        gridcolor=GRID,
+        zeroline=False,
+        title_font=dict(size=20, family="Arial, sans-serif", weight=600),
+        tickfont=dict(size=17, family="Arial, sans-serif", weight=600),
+    )
+    figure.update_yaxes(
+        title=None,
+        range=[-3.1, 3.1],
+        showline=True,
+        linecolor="#8BA4AA",
+        gridcolor=GRID,
+        zeroline=False,
+        title_font=dict(size=20, family="Arial, sans-serif", weight=600),
+        tickfont=dict(size=17, family="Arial, sans-serif", weight=600),
+    )
+    for col in range(2, 5):
+        figure.update_yaxes(showticklabels=False, row=1, col=col)
+    figure.add_annotation(
+        x=0.5,
+        y=-0.15,
+        xref="paper",
+        yref="paper",
+        text="Router-input PC 1",
+        showarrow=False,
+        font=dict(size=20, family="Arial, sans-serif", weight=600, color=INK),
+    )
+    figure.add_annotation(
+        x=-0.045,
+        y=0.5,
+        xref="paper",
+        yref="paper",
+        text="Router-input PC 2",
+        textangle=-90,
+        showarrow=False,
+        font=dict(size=20, family="Arial, sans-serif", weight=600, color=INK),
+    )
+    for annotation in list(figure.layout.annotations or ())[:4]:
+        annotation.update(font=dict(size=22, family="Arial, sans-serif", weight=600, color=INK))
+    return _write(figure, output_dir, "07_a4_routing_landscape_comparison_mock")
+
+
 def _write_tables(output_dir: Path) -> list[str]:
     predictors = output_dir / "table_router_predictors_mock.tex"
     predictors.write_text(
@@ -599,24 +850,34 @@ FlexDanish-8x7B-1T-a8-55B-v2-RT & 0.94 & 0.27 & 0.19 \\\\
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", default="tmp/routerinterp/mockups_v3", help="Directory under project tmp/.")
+    parser.add_argument(
+        "--only-a4-landscape",
+        action="store_true",
+        help="Render only the matched A4 routing-landscape layout preview.",
+    )
     args = parser.parse_args()
     output_dir = _output_path(args.output)
-    artifacts = [
-        *_predictor_mockup(output_dir),
-        *_domain_mockup(output_dir),
-        *_configuration_mockup(output_dir),
-        *_sae_mockup(output_dir),
-        *_distribution_mockup(output_dir),
-        *_model_summary_mockups(output_dir),
-        *_write_tables(output_dir),
-    ]
+    if args.only_a4_landscape:
+        artifacts = _a4_routing_landscape_mockup(output_dir)
+    else:
+        artifacts = [
+            *_predictor_mockup(output_dir),
+            *_domain_mockup(output_dir),
+            *_configuration_mockup(output_dir),
+            *_sae_mockup(output_dir),
+            *_distribution_mockup(output_dir),
+            *_model_summary_mockups(output_dir),
+            *_a4_routing_landscape_mockup(output_dir),
+            *_write_tables(output_dir),
+        ]
     manifest = {
         "warning": "All figures and tables in this directory use synthetic mock values only.",
         "models": MODEL_LABELS,
         "selected_layers": LAYERS,
         "artifacts": artifacts,
     }
-    (output_dir / "mockup_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    manifest_name = "a4_routing_landscape_mock_manifest.json" if args.only_a4_landscape else "mockup_manifest.json"
+    (output_dir / manifest_name).write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     print(json.dumps(manifest, indent=2))
 
 

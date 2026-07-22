@@ -28,6 +28,16 @@ from .fuzzy_trace import (
     evaluate_token_metrics,
 )
 from .fragmentation import *
+from .flex_lens import (
+    FlexLensConfig,
+    FlexLensTokenMetrics,
+    batch_token_metrics,
+    readout_hidden_states,
+    router_metrics,
+    softmax_probabilities,
+    target_logit_contributions,
+    token_metrics,
+)
 from .lens_eval import (
     LensEvalConfig,
     LensSurfaceMetrics,
@@ -85,6 +95,14 @@ __all__ = [
     "SurfaceFormConfig",
     "evaluate_surface_metrics",
     "evaluate_residual_alignment",
+    "FlexLensConfig",
+    "FlexLensTokenMetrics",
+    "batch_token_metrics",
+    "readout_hidden_states",
+    "router_metrics",
+    "softmax_probabilities",
+    "target_logit_contributions",
+    "token_metrics",
     "TokenAuditConfig",
     "TokenAuditRow",
     "build_token_audit_rows",

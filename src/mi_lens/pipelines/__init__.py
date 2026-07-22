@@ -19,6 +19,7 @@ from .run_compare import (
 from .run_capture import run_capture_pipeline
 from .run_compatibility import run_compatibility_pipeline
 from .run_jlens_fit import run_jlens_fit_pipeline
+from .run_flex_lens import run_flex_lens_pipeline
 from .run_routing_capture import *
 from .run_sparse_capture import run_sparse_capture_pipeline
 from .run_routerinterp import (
@@ -44,6 +45,7 @@ __all__ = [
     "run_capture_pipeline",
     "run_compatibility_pipeline",
     "run_jlens_fit_pipeline",
+    "run_flex_lens_pipeline",
     "run_sparse_capture_pipeline",
     "run_routerinterp_analysis_pipeline",
     "run_routerinterp_capture_pipeline",
