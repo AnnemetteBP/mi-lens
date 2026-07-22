@@ -281,6 +281,27 @@ def main() -> None:
             raise AssertionError(f"Missing ITDA analysis for layer {layer}.")
         if not (layer_dir / "topk_sae_top_rho_contexts.json").is_file():
             raise AssertionError(f"Missing Top-K SAE contexts for layer {layer}.")
+        if not (layer_dir / "expert_activation_patterns.pt").is_file():
+            raise AssertionError(f"Missing full expert activation patterns for layer {layer}.")
+        if not (layer_dir / "expert_activation_coactivation.json").is_file():
+            raise AssertionError(f"Missing expert coactivation summary for layer {layer}.")
+        dynamics = analysis_result["layers"][layer]["expert_activation_coactivation"]
+        if not dynamics["selected_expert_combinations"]:
+            raise AssertionError(f"Missing selected-expert combinations for layer {layer}.")
+        if not 0.0 <= float(dynamics["conditional_coactivation_offdiagonal_ratio"]) <= 1.0:
+            raise AssertionError(f"Invalid conditional coactivation ratio for layer {layer}.")
+        representation = analysis_result["layers"][layer]["heldout_router_representation_diagnostics"]
+        if not representation["available"]:
+            raise AssertionError(f"Missing held-out pre/post-router diagnostics for layer {layer}.")
+        if not -1.0 <= float(representation["pre_router_to_mixture_cosine"]["mean"]) <= 1.0:
+            raise AssertionError(f"Invalid pre/post-router cosine for layer {layer}.")
+        for key in ("router_dynamics_by_domain", "router_dynamics_by_language", "router_dynamics_by_dataset"):
+            grouped_dynamics = analysis_result["layers"][layer][key]["groups"]
+            if not grouped_dynamics:
+                raise AssertionError(f"Missing grouped router dynamics for {key} in layer {layer}.")
+            for group in grouped_dynamics:
+                if not group["routing_dynamics"]["selected_expert_combinations"]:
+                    raise AssertionError(f"Missing grouped expert combinations for {key} in layer {layer}.")
         routing = analysis_result["layers"][layer]["routing_prediction"]
         if routing["itda_predictor"] is None:
             raise AssertionError(f"Missing ITDA routing predictor for layer {layer}.")

@@ -8,7 +8,7 @@
     "eval_glob": "data/router/eval/*.jsonl"
   },
   "capture": {
-    "layers": "routerinterp_quartiles",
+    "layers": "routerinterp_paper_five_layers",
     "max_examples": null,
     "max_seq_len": null,
     "skip_first_token": false,

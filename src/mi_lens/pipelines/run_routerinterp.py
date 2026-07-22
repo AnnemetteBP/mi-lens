@@ -148,7 +148,14 @@ def run_routerinterp_streaming_sae_fit_pipeline(config: dict[str, Any]) -> dict[
     try:
         requested_layers = config["layers"]
         model_layers = list(iter_flex_olmo_layers(model))
-        if requested_layers == "routerinterp_quartiles":
+        if requested_layers == "routerinterp_paper_five_layers":
+            layer_count = len(model_layers)
+            if layer_count < 5:
+                raise ValueError("RouterInterp paper-style selection requires at least five layers.")
+            # Five equally spaced depth points: for 32 layers this is 5, 11,
+            # 18, 24, 31 (displayed as layers 6, 12, 19, 25, 32).
+            layers = tuple((index + 1) * layer_count // 5 - 1 for index in range(5))
+        elif requested_layers == "routerinterp_quartiles":
             layer_count = len(model_layers)
             layers = tuple((index + 1) * layer_count // 4 - 1 for index in range(4))
         else:
@@ -347,7 +354,12 @@ def run_routerinterp_capture_pipeline(config: dict[str, Any]) -> dict[str, Any]:
     model.eval()
     try:
         requested_layers = config["layers"]
-        if requested_layers == "routerinterp_quartiles":
+        if requested_layers == "routerinterp_paper_five_layers":
+            layer_count = len(iter_flex_olmo_layers(model))
+            if layer_count < 5:
+                raise ValueError("RouterInterp paper-style selection requires at least five layers.")
+            layers = tuple((index + 1) * layer_count // 5 - 1 for index in range(5))
+        elif requested_layers == "routerinterp_quartiles":
             layer_count = len(iter_flex_olmo_layers(model))
             if layer_count < 4:
                 raise ValueError("RouterInterp quartile selection requires at least four layers.")
@@ -831,6 +843,287 @@ def _expert_activation_targets_by_group(
         "groups": rows,
     }
     _require_json_finite(result, path="expert_activation_by_group")
+    return result
+
+
+def _expert_activation_coactivation_summary(
+    selected_experts: torch.Tensor,
+    *,
+    router_probabilities: torch.Tensor,
+    num_experts: int,
+    expert_labels: list[str],
+) -> dict[str, Any]:
+    """Save FlexEval-compatible held-out router dynamics for one layer."""
+
+    if len(expert_labels) != num_experts:
+        raise ValueError("Expert coactivation labels must match the router width.")
+    _require_probability_matrix("router probabilities for routing diagnostics", router_probabilities)
+    if router_probabilities.shape[0] != selected_experts.shape[0]:
+        raise ValueError("Router probabilities and selected experts must have the same token count.")
+    if router_probabilities.shape[1] != num_experts:
+        raise ValueError("Router probability width does not match the configured expert count.")
+    targets = selected_expert_targets(selected_experts, num_experts).to(dtype=torch.float64)
+    token_count = int(targets.shape[0])
+    if token_count < 1:
+        raise ValueError("Expert coactivation requires at least one held-out token.")
+    top_k = int(selected_experts.shape[1])
+    activation_counts = targets.sum(dim=0)
+    pair_counts = targets.T @ targets
+    pair_rates = pair_counts / token_count
+    activation_rates = activation_counts / token_count
+    conditional_coactivation = pair_counts / activation_counts.unsqueeze(1).clamp_min(1.0)
+    expected_rates = torch.outer(activation_rates, activation_rates)
+    enrichment = pair_rates / expected_rates.clamp_min(1e-12)
+    top1_ids = router_probabilities.argmax(dim=1)
+    top1_counts = torch.bincount(top1_ids, minlength=num_experts).to(dtype=torch.float64)
+    top1_rates = top1_counts / token_count
+    top_summary_k = min(2, num_experts)
+    top_values, top_ids = router_probabilities.topk(k=top_summary_k, dim=1)
+    top1_probabilities = top_values[:, 0]
+    top2_probabilities = top_values[:, 1] if top_summary_k > 1 else torch.zeros_like(top1_probabilities)
+    margins = top1_probabilities - top2_probabilities
+    entropy = -(router_probabilities * router_probabilities.clamp_min(1e-12).log()).sum(dim=1)
+    normalized_entropy = entropy / math.log(float(num_experts)) if num_experts > 1 else torch.zeros_like(entropy)
+    selected_probability_mass = router_probabilities.gather(dim=1, index=selected_experts).sum(dim=1)
+    top1_top2_counts = torch.zeros((num_experts, num_experts), dtype=torch.int64)
+    if top_summary_k > 1:
+        flattened = top_ids[:, 0].to(torch.int64) * num_experts + top_ids[:, 1].to(torch.int64)
+        top1_top2_counts = torch.bincount(flattened, minlength=num_experts * num_experts).reshape(num_experts, num_experts)
+    combinations: dict[tuple[int, ...], int] = {}
+    for row in selected_experts.cpu().tolist():
+        combination = tuple(sorted(int(expert) for expert in row))
+        combinations[combination] = combinations.get(combination, 0) + 1
+    top_combinations = [
+        {
+            "expert_ids": list(combination),
+            "expert_labels": [expert_labels[expert] for expert in combination],
+            "count": count,
+            "rate": count / token_count,
+        }
+        for combination, count in sorted(combinations.items(), key=lambda item: (-item[1], item[0]))
+    ]
+    conditional_total = conditional_coactivation.sum()
+    offdiagonal_ratio = (
+        (conditional_total - conditional_coactivation.diag().sum()) / conditional_total
+        if float(conditional_total.item()) > 0
+        else torch.tensor(0.0, dtype=torch.float64)
+    )
+    _require_finite_tensor("expert activation counts", activation_counts)
+    _require_finite_tensor("expert pair coactivation counts", pair_counts)
+    _require_finite_tensor("expert pair coactivation rates", pair_rates)
+    _require_finite_tensor("conditional expert coactivation", conditional_coactivation)
+    _require_finite_tensor("expert pair coactivation enrichment", enrichment)
+    if not torch.equal(pair_counts, pair_counts.T):
+        raise ValueError("Expert pair coactivation counts must be symmetric.")
+    if not torch.allclose(pair_counts.diag(), activation_counts):
+        raise ValueError("Expert coactivation diagonal must equal expert activation counts.")
+    if (activation_rates < 0).any() or (activation_rates > 1).any():
+        raise ValueError("Expert activation rates must be in [0, 1].")
+    if (pair_rates < 0).any() or (pair_rates > 1).any():
+        raise ValueError("Expert pair coactivation rates must be in [0, 1].")
+    if (conditional_coactivation < 0).any() or (conditional_coactivation > 1).any():
+        raise ValueError("Conditional expert coactivation must be in [0, 1].")
+    if not 0.0 <= float(offdiagonal_ratio.item()) <= 1.0:
+        raise ValueError("Conditional coactivation off-diagonal ratio must be in [0, 1].")
+    if (normalized_entropy < -1e-6).any() or (normalized_entropy > 1.0 + 1e-6).any():
+        raise ValueError("Normalised router entropy must be in [0, 1].")
+    if (selected_probability_mass < -1e-6).any() or (selected_probability_mass > 1.0 + 1e-6).any():
+        raise ValueError("Selected router probability mass must be in [0, 1].")
+    result = {
+        "token_count": token_count,
+        "routing_top_k": top_k,
+        "expert_labels": expert_labels,
+        "activation_count": [int(value) for value in activation_counts.tolist()],
+        "activation_rate": [float(value) for value in activation_rates.tolist()],
+        "pair_coactivation_count": [[int(value) for value in row] for row in pair_counts.tolist()],
+        "pair_coactivation_rate": [[float(value) for value in row] for row in pair_rates.tolist()],
+        "conditional_coactivation_probability": [
+            [float(value) for value in row] for row in conditional_coactivation.tolist()
+        ],
+        "pair_enrichment_vs_independence": [[float(value) for value in row] for row in enrichment.tolist()],
+        "conditional_coactivation_offdiagonal_ratio": float(offdiagonal_ratio.item()),
+        "top1_activation_count": [int(value) for value in top1_counts.tolist()],
+        "top1_activation_rate": [float(value) for value in top1_rates.tolist()],
+        "top1_top2_confusion_count": [[int(value) for value in row] for row in top1_top2_counts.tolist()],
+        "top1_top2_confusion_rate": [
+            [float(value) for value in row] for row in (top1_top2_counts.to(torch.float64) / token_count).tolist()
+        ],
+        "selected_expert_combinations": top_combinations,
+        "router_confidence": {
+            "mean_top1_probability": float(top1_probabilities.mean().item()),
+            "mean_top2_probability": float(top2_probabilities.mean().item()),
+            "mean_top1_top2_margin": float(margins.mean().item()),
+            "mean_normalized_entropy": float(normalized_entropy.mean().item()),
+            "mean_selected_expert_probability_mass": float(selected_probability_mass.mean().item()),
+        },
+    }
+    _require_json_finite(result, path="expert_activation_coactivation")
+    return result
+
+
+def _accumulate_tensor_moments(accumulator: dict[str, float | int] | None, values: torch.Tensor) -> dict[str, float | int]:
+    """Accumulate scalar moments without retaining another full activation copy."""
+
+    values = values.float()
+    _require_finite_tensor("routing diagnostic values", values)
+    flattened = values.reshape(-1)
+    if flattened.numel() < 1:
+        raise ValueError("Routing diagnostic values must be non-empty.")
+    if accumulator is None:
+        accumulator = {
+            "count": 0,
+            "sum": 0.0,
+            "sum_squares": 0.0,
+            "min": float("inf"),
+            "max": float("-inf"),
+        }
+    accumulator["count"] = int(accumulator["count"]) + int(flattened.numel())
+    accumulator["sum"] = float(accumulator["sum"]) + float(flattened.sum().item())
+    accumulator["sum_squares"] = float(accumulator["sum_squares"]) + float((flattened * flattened).sum().item())
+    accumulator["min"] = min(float(accumulator["min"]), float(flattened.min().item()))
+    accumulator["max"] = max(float(accumulator["max"]), float(flattened.max().item()))
+    return accumulator
+
+
+def _finalize_tensor_moments(accumulator: dict[str, float | int], *, name: str) -> dict[str, float | int]:
+    count = int(accumulator["count"])
+    if count < 1:
+        raise ValueError(f"{name} received no values.")
+    mean = float(accumulator["sum"]) / count
+    variance = max(0.0, float(accumulator["sum_squares"]) / count - mean * mean)
+    result = {
+        "value_count": count,
+        "mean": mean,
+        "std": math.sqrt(variance),
+        "min": float(accumulator["min"]),
+        "max": float(accumulator["max"]),
+    }
+    _require_json_finite(result, path=name)
+    return result
+
+
+def _heldout_router_representation_diagnostics(
+    artifact_dir: Path,
+    *,
+    layer: int,
+    max_tokens: int | None,
+) -> dict[str, Any]:
+    """Summarise saved gate and MLP states without materialising a second corpus copy."""
+
+    manifest = json.loads((artifact_dir / "manifest.json").read_text(encoding="utf-8"))
+    router_scores: dict[str, float | int] | None = None
+    pre_router: dict[str, float | int] | None = None
+    mixture_output: dict[str, float | int] | None = None
+    selected_weights: dict[str, float | int] | None = None
+    selected_weight_mass: dict[str, float | int] | None = None
+    pre_norms: dict[str, float | int] | None = None
+    mixture_norms: dict[str, float | int] | None = None
+    cosine: dict[str, float | int] | None = None
+    retained = 0
+    for row in manifest["prompts"]:
+        if max_tokens is not None and retained >= max_tokens:
+            break
+        payload = torch.load(artifact_dir / row["path"], map_location="cpu", weights_only=True)
+        block = payload.get("layers", {}).get(str(layer), {})
+        required = {"router_scores", "router_input", "mixture_output", "selected_weights"}
+        if not required.issubset(block) or block["mixture_output"] is None:
+            return {
+                "available": False,
+                "reason": "This capture predates full router-state persistence; rerun held-out capture with the current pipeline.",
+            }
+        scores = block["router_scores"].float()
+        pre = block["router_input"].float()
+        post = block["mixture_output"].float()
+        weights = block["selected_weights"].float()
+        if max_tokens is not None:
+            remaining = max_tokens - retained
+            scores, pre, post, weights = scores[:remaining], pre[:remaining], post[:remaining], weights[:remaining]
+        if scores.ndim != 2 or pre.ndim != 2 or post.ndim != 2 or weights.ndim != 2:
+            raise ValueError("Saved router diagnostics must be rank-two token matrices.")
+        if not (scores.shape[0] == pre.shape[0] == post.shape[0] == weights.shape[0]):
+            raise ValueError("Saved router diagnostic token counts are not aligned.")
+        if pre.shape[1] != post.shape[1]:
+            raise ValueError("Pre-router and MLP mixture outputs must share the hidden width.")
+        _require_finite_tensor("saved router scores", scores)
+        _require_finite_tensor("saved selected router weights", weights)
+        if (weights < -1e-6).any() or (weights > 1.0 + 1e-6).any():
+            raise ValueError("Selected router weights must lie in [0, 1].")
+        weight_sums = weights.sum(dim=1)
+        router_scores = _accumulate_tensor_moments(router_scores, scores)
+        pre_router = _accumulate_tensor_moments(pre_router, pre)
+        mixture_output = _accumulate_tensor_moments(mixture_output, post)
+        selected_weights = _accumulate_tensor_moments(selected_weights, weights)
+        selected_weight_mass = _accumulate_tensor_moments(selected_weight_mass, weight_sums)
+        pre_norms = _accumulate_tensor_moments(pre_norms, pre.norm(dim=1))
+        mixture_norms = _accumulate_tensor_moments(mixture_norms, post.norm(dim=1))
+        cosine = _accumulate_tensor_moments(
+            cosine,
+            torch.nn.functional.cosine_similarity(pre, post, dim=1, eps=1e-8),
+        )
+        retained += int(pre.shape[0])
+    if retained < 1 or any(
+        value is None
+        for value in (
+            router_scores,
+            pre_router,
+            mixture_output,
+            selected_weights,
+            selected_weight_mass,
+            pre_norms,
+            mixture_norms,
+            cosine,
+        )
+    ):
+        raise ValueError("No complete held-out router diagnostic artifacts were found.")
+    result = {
+        "available": True,
+        "token_count": retained,
+        "router_score_elements": _finalize_tensor_moments(router_scores, name="router_scores"),
+        "pre_router_elements": _finalize_tensor_moments(pre_router, name="pre_router"),
+        "mixture_output_elements": _finalize_tensor_moments(mixture_output, name="mixture_output"),
+        "selected_weight_elements": _finalize_tensor_moments(selected_weights, name="selected_weights"),
+        "selected_weight_mass": _finalize_tensor_moments(selected_weight_mass, name="selected_weight_mass"),
+        "pre_router_l2_norm": _finalize_tensor_moments(pre_norms, name="pre_router_l2_norm"),
+        "mixture_output_l2_norm": _finalize_tensor_moments(mixture_norms, name="mixture_output_l2_norm"),
+        "pre_router_to_mixture_cosine": _finalize_tensor_moments(cosine, name="pre_router_to_mixture_cosine"),
+    }
+    cosine_summary = result["pre_router_to_mixture_cosine"]
+    if float(cosine_summary["min"]) < -1.00001 or float(cosine_summary["max"]) > 1.00001:
+        raise ValueError("Pre-router to mixture cosine must be in [-1, 1].")
+    _require_json_finite(result, path="heldout_router_representation_diagnostics")
+    return result
+
+
+def _router_dynamics_by_group(
+    selected_experts: torch.Tensor,
+    router_probabilities: torch.Tensor,
+    groups: list[str],
+    *,
+    num_experts: int,
+    expert_labels: list[str],
+) -> dict[str, Any]:
+    """Persist complete routing dynamics for every observed provenance group."""
+
+    if len(groups) != selected_experts.shape[0]:
+        raise ValueError("Each routed token must retain one provenance-group label.")
+    result_groups: list[dict[str, Any]] = []
+    for group in sorted(set(groups)):
+        mask = torch.tensor([value == group for value in groups], dtype=torch.bool)
+        if not bool(mask.any()):
+            continue
+        result_groups.append(
+            {
+                "group": group,
+                "routing_dynamics": _expert_activation_coactivation_summary(
+                    selected_experts[mask].cpu(),
+                    router_probabilities=router_probabilities[mask].cpu(),
+                    num_experts=num_experts,
+                    expert_labels=expert_labels,
+                ),
+            }
+        )
+    result = {"groups": result_groups}
+    _require_json_finite(result, path="router_dynamics_by_group")
     return result
 
 
@@ -1532,6 +1825,58 @@ def run_routerinterp_analysis_pipeline(config: dict[str, Any]) -> dict[str, Any]
 
         layer_dir = output_dir / f"layer_{layer:02d}"
         layer_dir.mkdir(parents=True, exist_ok=True)
+        activation_patterns_path = layer_dir / "expert_activation_patterns.pt"
+        coactivation_path = layer_dir / "expert_activation_coactivation.json"
+        expert_activation_coactivation = _expert_activation_coactivation_summary(
+            eval_selected.cpu(),
+            router_probabilities=eval_router_probabilities.cpu(),
+            num_experts=n_experts,
+            expert_labels=expert_labels,
+        )
+        router_dynamics_by_domain = _router_dynamics_by_group(
+            eval_selected,
+            eval_router_probabilities,
+            eval_domains,
+            num_experts=n_experts,
+            expert_labels=expert_labels,
+        )
+        router_dynamics_by_language = _router_dynamics_by_group(
+            eval_selected,
+            eval_router_probabilities,
+            eval_languages,
+            num_experts=n_experts,
+            expert_labels=expert_labels,
+        )
+        router_dynamics_by_dataset = _router_dynamics_by_group(
+            eval_selected,
+            eval_router_probabilities,
+            eval_datasets,
+            num_experts=n_experts,
+            expert_labels=expert_labels,
+        )
+        heldout_router_representation_diagnostics = _heldout_router_representation_diagnostics(
+            eval_dir,
+            layer=layer,
+            max_tokens=eval_token_count,
+        )
+        # Keep full held-out router outcomes in one aligned artifact for later
+        # activation, coactivation, and routing-region analyses.
+        torch.save(
+            {
+                "format": "mi_lens.routerinterp.expert_activation_patterns.v1",
+                "layer": layer,
+                "expert_labels": expert_labels,
+                "token_ids": eval_token_ids.cpu(),
+                "previous_token_ids": eval_previous_token_ids.cpu(),
+                "selected_experts": eval_selected.cpu(),
+                "router_probabilities": eval_router_probabilities.cpu(),
+                "domain": eval_domains,
+                "language": eval_languages,
+                "dataset_name": eval_datasets,
+            },
+            activation_patterns_path,
+        )
+        write_json(coactivation_path, expert_activation_coactivation)
         sae.save_pretrained(str(layer_dir / "topk_sae.pt"))
         torch.save(
             {
@@ -1591,6 +1936,11 @@ def run_routerinterp_analysis_pipeline(config: dict[str, Any]) -> dict[str, Any]
             "router_probability_distribution": _router_probability_distribution_summary(
                 eval_router_probabilities.cpu()
             ),
+            "expert_activation_coactivation": expert_activation_coactivation,
+            "router_dynamics_by_domain": router_dynamics_by_domain,
+            "router_dynamics_by_language": router_dynamics_by_language,
+            "router_dynamics_by_dataset": router_dynamics_by_dataset,
+            "heldout_router_representation_diagnostics": heldout_router_representation_diagnostics,
             "domain_routing": domain_routing,
             "domain_expert_activation": actual_domain_expert_activation,
             "sae_predicted_domain_expert_activation": sae_predicted_domain_expert_activation,
@@ -1610,6 +1960,8 @@ def run_routerinterp_analysis_pipeline(config: dict[str, Any]) -> dict[str, Any]
             ],
             "top_rho_context_artifact": str(layer_dir / "topk_sae_top_rho_contexts.json"),
             "top_rho_domain_profile_artifact": str(layer_dir / "topk_sae_top_rho_domain_profiles.json"),
+            "expert_activation_pattern_artifact": str(activation_patterns_path),
+            "expert_coactivation_artifact": str(coactivation_path),
             "artifact_dir": str(layer_dir),
         }
         _require_json_finite(layer_result, path=f"layer_{layer}")

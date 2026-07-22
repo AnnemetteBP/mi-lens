@@ -39,8 +39,11 @@ def _require_probability_rows(name: str, probabilities: torch.Tensor) -> None:
 @dataclass(slots=True)
 class RouterLayerCapture:
     router_input: torch.Tensor
+    router_scores: torch.Tensor
     router_probabilities: torch.Tensor
     selected_experts: torch.Tensor
+    selected_weights: torch.Tensor
+    mixture_output: torch.Tensor | None = None
 
 
 @dataclass(slots=True)
@@ -69,23 +72,30 @@ def capture_flexolmo_router_layers(
     inputs: Mapping[str, Any],
     *,
     top_k: int | None = None,
+    capture_mixture_output: bool = False,
 ) -> tuple[RouterLayerCapture, ...]:
-    """Capture exact pre-gate activations and selected experts for one forward pass."""
+    """Capture router inputs, routing decisions, and optional MLP mixture outputs."""
 
     batch_size, sequence_length = input_batch_and_sequence_length(inputs)
     if batch_size is None or sequence_length is None:
         raise ValueError("RouterInterp capture requires batched `input_ids`.")
     raw_inputs: list[torch.Tensor] = []
     raw_outputs: list[Any] = []
+    raw_mixture_outputs: list[Any] = []
     handles = []
 
     def hook(_module, hook_inputs, output):
         raw_inputs.append(hook_inputs[0].detach())
         raw_outputs.append(output)
 
+    def mixture_hook(_module, _hook_inputs, output):
+        raw_mixture_outputs.append(output.detach() if isinstance(output, torch.Tensor) else output)
+
     try:
         for layer in iter_flex_olmo_layers(model):
             handles.append(layer.mlp.gate.register_forward_hook(hook))
+            if capture_mixture_output:
+                handles.append(layer.mlp.register_forward_hook(mixture_hook))
         with torch.no_grad():
             model(**inputs, use_cache=False)
     finally:
@@ -94,9 +104,11 @@ def capture_flexolmo_router_layers(
 
     if not raw_inputs or len(raw_inputs) != len(raw_outputs):
         raise ValueError("No aligned FlexOlmo router inputs and outputs were captured.")
+    if capture_mixture_output and len(raw_mixture_outputs) != len(raw_inputs):
+        raise ValueError("No aligned FlexOlmo MLP mixture outputs were captured.")
 
     captures = []
-    for router_input, output in zip(raw_inputs, raw_outputs):
+    for layer_index, (router_input, output) in enumerate(zip(raw_inputs, raw_outputs)):
         router_scores = output[0] if isinstance(output, tuple) else output
         if not isinstance(router_scores, torch.Tensor):
             raise TypeError("FlexOlmo router did not return a tensor as its first gate output.")
@@ -113,11 +125,38 @@ def capture_flexolmo_router_layers(
             raise ValueError(
                 f"Router top-k={effective_top_k} is invalid for {probabilities.shape[-1]} experts."
             )
+        selected_experts = probabilities.topk(k=effective_top_k, dim=-1).indices
+        selected_weights = probabilities.gather(dim=-1, index=selected_experts)
+        if isinstance(output, tuple) and len(output) >= 3:
+            candidate_weights, candidate_indices = output[1], output[2]
+            if isinstance(candidate_weights, torch.Tensor) and isinstance(candidate_indices, torch.Tensor):
+                candidate_weights = _as_batch_sequence(candidate_weights, batch_size, sequence_length)
+                candidate_indices = _as_batch_sequence(candidate_indices, batch_size, sequence_length).long()
+                if candidate_indices.shape[-1] >= effective_top_k:
+                    candidate_indices = candidate_indices[..., :effective_top_k]
+                    candidate_weights = candidate_weights[..., :effective_top_k]
+                    if (candidate_indices < 0).any() or (candidate_indices >= probabilities.shape[-1]).any():
+                        raise ValueError("FlexOlmo gate returned out-of-range selected expert ids.")
+                    # Retain the gate's actual selected order and mixture weights.
+                    selected_experts = candidate_indices
+                    selected_weights = candidate_weights
+        mixture_output = None
+        if capture_mixture_output:
+            captured_output = raw_mixture_outputs[layer_index]
+            if isinstance(captured_output, tuple):
+                captured_output = captured_output[0]
+            if not isinstance(captured_output, torch.Tensor):
+                raise TypeError("FlexOlmo MLP did not return a tensor mixture output.")
+            mixture_output = _as_batch_sequence(captured_output, batch_size, sequence_length).float()
+            _require_finite("post-router mixture output", mixture_output)
         captures.append(
             RouterLayerCapture(
                 router_input=router_input,
+                router_scores=router_scores,
                 router_probabilities=probabilities,
-                selected_experts=probabilities.topk(k=effective_top_k, dim=-1).indices,
+                selected_experts=selected_experts,
+                selected_weights=selected_weights,
+                mixture_output=mixture_output,
             )
         )
     return tuple(captures)
@@ -176,7 +215,11 @@ def capture_routerinterp_prompt_artifacts(
             positions = positions[: max(0, remaining)]
         if not positions:
             continue
-        captures = capture_flexolmo_router_layers(model, {"input_ids": input_ids})
+        captures = capture_flexolmo_router_layers(
+            model,
+            {"input_ids": input_ids},
+            capture_mixture_output=True,
+        )
         if selected_layers and selected_layers[-1] >= len(captures):
             raise ValueError(f"Requested layer {selected_layers[-1]} but captured {len(captures)} layers.")
         artifact_layers = {}
@@ -190,8 +233,15 @@ def capture_routerinterp_prompt_artifacts(
                 )
             artifact_layers[str(layer)] = {
                 "router_input": capture.router_input[0, positions].cpu().to(artifact_dtype),
+                "router_scores": capture.router_scores[0, positions].cpu().to(artifact_dtype),
                 "router_probabilities": capture.router_probabilities[0, positions].cpu().to(artifact_dtype),
                 "selected_experts": capture.selected_experts[0, positions].cpu(),
+                "selected_weights": capture.selected_weights[0, positions].cpu().to(artifact_dtype),
+                "mixture_output": (
+                    capture.mixture_output[0, positions].cpu().to(artifact_dtype)
+                    if capture.mixture_output is not None
+                    else None
+                ),
             }
         file_name = f"prompt_{prompt_index:06d}.pt"
         torch.save(
