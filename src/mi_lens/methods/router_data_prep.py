@@ -29,42 +29,20 @@ _PARQUET_CONVERSION_CONFIGS = {
 
 
 # Keep the runtime RouterInterp pipeline independent of a local FlexEval clone.
-# These are the official source IDs used by EuroEval's Danish configurations.
+# EuroEval's former ``EuroEval/...`` Hub repos were removed.  These maintained
+# public sources provide the same Danish tasks and are validated by the cache
+# warm-up stage before any model is loaded.
 _EUROEVAL_DANISH_SOURCES = {
-    "angry-tweets": "EuroEval/angry-tweets-mini",
-    "scala-da": "EuroEval/scala-da",
-    "dansk": "EuroEval/dansk-mini",
-    "multi-wiki-qa-da": "EuroEval/multi-wiki-qa-da-mini",
-    "nordjylland-news": "EuroEval/nordjylland-news-mini",
-    "danske-talemaader": "EuroEval/danske-talemaader",
-    "danish-citizen-tests": "EuroEval/danish-citizen-tests-updated",
-    "hellaswag-da": "EuroEval/hellaswag-da-mini",
-    "ifeval-da": "EuroEval/ifeval-da",
-    "valeu-da": "EuroEval/european-values-da",
+    "angry-tweets": "sorenmulli/angry-tweets-mini",
+    "scala-da": "alexandrainst/scala",
+    "dansk": "sorenmulli/dane-mini",
+    "multi-wiki-qa-da": "alexandrainst/multi-wiki-qa",
+    "nordjylland-news": "alexandrainst/nordjylland-news-summarization",
+    "danske-talemaader": "Juunge/danske-talemaader-QA",
+    "danish-citizen-tests": "sorenmulli/citizenship-test-da",
+    "hellaswag-da": "alexandrainst/m_hellaswag",
+    "ifeval-da": "danish-foundation-models/ifeval-da",
 }
-
-_EUROEVAL_DANISH_PROMPTS = {
-    "angry-tweets": ("Dokument: {text}\nSentiment: {label}", ("positiv", "neutral", "negativ")),
-    "scala-da": ("Sætning: {text}\nGrammatisk korrekt: {label}", ("ja", "nej")),
-    "dansk": ("Sætning: {text}\nNavngivne entiteter:", ()),
-    "multi-wiki-qa-da": ("Tekst: {text}\nSpørgsmål: {question}\nSvar med maks. 3 ord: {label}", ()),
-    "nordjylland-news": ("Dokument: {text}\nResumé: {target_text}", ()),
-    "danske-talemaader": ("Spørgsmål: {text}\nSvar: {label}", ("a", "b", "c", "d")),
-    "danish-citizen-tests": ("Spørgsmål: {text}\nSvar: {label}", ("a", "b", "c", "d")),
-    "hellaswag-da": ("Spørgsmål: {text}\nSvar: {label}", ("a", "b", "c", "d")),
-    "ifeval-da": ("Opgave: {text}\nSvar:", ()),
-    "valeu-da": ("Spørgsmål: {text}\nSvar: {label}", ()),
-}
-
-
-@dataclass(frozen=True, slots=True)
-class _EuroEvalFallbackConfig:
-    prompt_template: str
-    labels: tuple[str, ...]
-
-    def get_labels_str(self) -> str:
-        return ", ".join(self.labels)
-
 
 @dataclass(slots=True)
 class RouterDatasetExportSpec:
@@ -136,22 +114,30 @@ def _configure_hf_cache(cache_dir: Path) -> None:
 
 
 def _load_euroeval_dataset(spec: RouterDatasetExportSpec, cache_dir: Path):
-    """Load an official Danish EuroEval source without importing FlexEval."""
+    """Load a maintained Danish task source without importing FlexEval."""
 
     try:
         source = _EUROEVAL_DANISH_SOURCES[spec.dataset_name]
-        prompt_template, labels = _EUROEVAL_DANISH_PROMPTS[spec.dataset_name]
     except KeyError as exc:
         raise KeyError(f"Unknown EuroEval Danish dataset {spec.dataset_name!r}.") from exc
-    # This provider is deliberately local to mi-lens. UCloud needs only the
-    # authenticated Hub endpoint; no FlexEval checkout or package is imported.
+    # Nordjylland has mixed historical schemas in its dataset metadata.  The
+    # explicit Parquet file in the config selects the current text/summary data.
+    if spec.data_file is not None:
+        return load_dataset(
+            "parquet",
+            data_files={spec.split: spec.data_file},
+            split=spec.split,
+            cache_dir=str(cache_dir),
+            token=os.environ.get("HF_TOKEN"),
+        ), None
     dataset = load_dataset(
         source,
+        spec.config_name,
         split=spec.split,
         cache_dir=str(cache_dir),
         token=os.environ.get("HF_TOKEN"),
     )
-    return dataset, _EuroEvalFallbackConfig(prompt_template=prompt_template, labels=labels)
+    return dataset, None
 
 
 def _load_router_dataset(spec: RouterDatasetExportSpec, cache_dir: Path):
@@ -248,6 +234,68 @@ def _apply_template(template: str, item: dict[str, Any], *, source_idx: int) -> 
     return template.format_map(RequiredFields({key: _as_text(value) for key, value in item.items()}))
 
 
+def _build_euroeval_row(
+    spec: RouterDatasetExportSpec,
+    item: dict[str, Any],
+    *,
+    source_idx: int,
+) -> tuple[str, list[Any] | None, int | str | None, str | None]:
+    """Build prompts from the maintained Danish task schemas.
+
+    The source datasets do not share EuroEval's former preprocessed schema, so
+    their task-specific fields must be handled explicitly rather than guessed.
+    """
+
+    dataset_name = spec.dataset_name
+    if dataset_name == "angry-tweets":
+        text = _as_text(_require_field(item, "text", source_idx=source_idx))
+        return f"Tekst: {text}\nSentiment:", None, _normalize_label(item.get("label")), None
+    if dataset_name == "scala-da":
+        text = _as_text(_require_field(item, "text", source_idx=source_idx))
+        return f"Sætning: {text}\nGrammatisk korrekt:", None, _normalize_label(item.get("label")), None
+    if dataset_name == "dansk":
+        text = _as_text(_require_field(item, "text", source_idx=source_idx))
+        return f"Sætning: {text}\nNavngivne entiteter:", None, None, None
+    if dataset_name == "multi-wiki-qa-da":
+        context = _as_text(_require_field(item, "context", source_idx=source_idx))
+        question = _as_text(_require_field(item, "question", source_idx=source_idx))
+        answers = _require_field(item, "answers", source_idx=source_idx)
+        answer_texts = answers.get("text", []) if isinstance(answers, dict) else []
+        gold_text = _as_text(answer_texts[0]) if answer_texts else None
+        return f"Tekst: {context}\nSpørgsmål: {question}\nSvar:", None, None, gold_text
+    if dataset_name == "nordjylland-news":
+        text = _as_text(_require_field(item, "text", source_idx=source_idx))
+        summary = _as_text(_require_field(item, "summary", source_idx=source_idx))
+        return f"Dokument: {text}\nResumé:", None, None, summary
+    if dataset_name == "danske-talemaader":
+        question = _as_text(_require_field(item, "instruction", source_idx=source_idx))
+        choices = [
+            _require_field(item, "option_a", source_idx=source_idx),
+            _require_field(item, "option_b", source_idx=source_idx),
+            _require_field(item, "option_c", source_idx=source_idx),
+            _require_field(item, "option_d", source_idx=source_idx),
+        ]
+        return f"Spørgsmål: {question}\n{_format_choices(choices)}\nSvar:", choices, _normalize_label(item.get("answer"), choices), None
+    if dataset_name == "danish-citizen-tests":
+        question = _as_text(_require_field(item, "question", source_idx=source_idx))
+        choices = [
+            _require_field(item, "option-A", source_idx=source_idx),
+            _require_field(item, "option-B", source_idx=source_idx),
+        ]
+        option_c = item.get("option-C")
+        if option_c is not None:
+            choices.append(option_c)
+        return f"Spørgsmål: {question}\n{_format_choices(choices)}\nSvar:", choices, _normalize_label(item.get("correct"), choices), None
+    if dataset_name == "hellaswag-da":
+        context = _as_text(_require_field(item, "ctx", source_idx=source_idx))
+        choices = list(_require_field(item, "endings", source_idx=source_idx))
+        return f"Fortsæt teksten:\n{context}\n{_format_choices(choices)}\nSvar:", choices, _normalize_label(item.get("label"), choices), None
+    if dataset_name == "ifeval-da":
+        prompt = _as_text(_require_field(item, "prompt", source_idx=source_idx))
+        return f"Opgave: {prompt}\nSvar:", None, None, None
+    raise KeyError(f"Unsupported Danish task prompt builder for {dataset_name!r}.")
+
+
 def _build_row(
     spec: RouterDatasetExportSpec,
     item: dict[str, Any],
@@ -263,17 +311,9 @@ def _build_row(
     if adapter == "text":
         prompt = _as_text(_require_field(item, spec.text_field, source_idx=source_idx))
     elif adapter == "euroeval":
-        if euroeval_config is None:
-            raise ValueError("adapter='euroeval' requires loader='euroeval'.")
-        values = {key: _as_text(value) for key, value in item.items()}
-        values["text"] = _as_text(_require_field(item, "text", source_idx=source_idx))
-        values["label"] = ""
-        values["target_text"] = ""
-        values["labels_str"] = euroeval_config.get_labels_str()
-        prompt = euroeval_config.prompt_template.format(**values)
-        if euroeval_config.prompt_prefix:
-            prompt = euroeval_config.prompt_prefix.format(labels_str=values["labels_str"]) + "\n\n" + prompt
-        gold = item.get("label", item.get("target_text"))
+        prompt, choices, gold, gold_text = _build_euroeval_row(
+            spec, item, source_idx=source_idx
+        )
     elif adapter == "template":
         if not spec.prompt_template:
             raise ValueError(f"{spec.name}: adapter='template' requires prompt_template.")

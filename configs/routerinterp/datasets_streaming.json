@@ -1,5 +1,5 @@
 {
-  "description": "Source-order RouterInterp data. Providers are loaded at run time and cached only in tmp/hf_cache. No full JSONL export is created. SAE fitting uses train partitions; router analysis uses corresponding test partitions.",
+  "description": "Source-order RouterInterp data. Providers are loaded at run time and cached only in tmp/hf_cache. No full JSONL export is created. SAE fitting and router analysis use disjoint official train/test partitions where available, or non-overlapping source-order slices otherwise.",
   "sae_fit": [
     {"name": "gsm8k_en_train", "dataset_name": "openai/gsm8k", "config_name": "main", "split": "train", "domain": "math", "language": "en", "adapter": "gsm8k", "native_id_field": "id", "max_records": null},
     {"name": "hellaswag_en_train", "dataset_name": "allenai/hellaswag", "split": "train", "domain": "general", "language": "en", "adapter": "hellaswag", "native_id_field": "ind", "max_records": null},
@@ -8,13 +8,13 @@
     {"name": "muse_news_en_retain1", "dataset_name": "muse-bench/MUSE-News", "config_name": "train", "split": "retain1", "domain": "news", "language": "en", "adapter": "muse_news", "native_id_field": "id", "max_records": null},
 
     {"name": "angry_tweets_da_train", "dataset_name": "angry-tweets", "loader": "euroeval", "split": "train", "domain": "social", "language": "da", "adapter": "euroeval", "max_records": null},
-    {"name": "scala_da_train", "dataset_name": "scala-da", "loader": "euroeval", "split": "train", "domain": "linguistic_acceptability", "language": "da", "adapter": "euroeval", "max_records": null},
+    {"name": "scala_da_train", "dataset_name": "scala-da", "loader": "euroeval", "config_name": "da", "split": "train", "domain": "linguistic_acceptability", "language": "da", "adapter": "euroeval", "max_records": null},
     {"name": "dansk_da_train", "dataset_name": "dansk", "loader": "euroeval", "split": "train", "domain": "named_entities", "language": "da", "adapter": "euroeval", "max_records": null},
-    {"name": "multi_wiki_qa_da_train", "dataset_name": "multi-wiki-qa-da", "loader": "euroeval", "split": "train", "domain": "knowledge", "language": "da", "adapter": "euroeval", "max_records": null},
-    {"name": "nordjylland_news_da_train", "dataset_name": "nordjylland-news", "loader": "euroeval", "split": "train", "domain": "news", "language": "da", "adapter": "euroeval", "max_records": null},
-    {"name": "danske_talemaader_da_train", "dataset_name": "danske-talemaader", "loader": "euroeval", "split": "train", "domain": "knowledge", "language": "da", "adapter": "euroeval", "max_records": null},
-    {"name": "danish_citizen_tests_da_train", "dataset_name": "danish-citizen-tests", "loader": "euroeval", "split": "train", "domain": "knowledge", "language": "da", "adapter": "euroeval", "max_records": null},
-    {"name": "hellaswag_da_train", "dataset_name": "hellaswag-da", "loader": "euroeval", "split": "train", "domain": "general", "language": "da", "adapter": "euroeval", "max_records": null}
+    {"name": "multi_wiki_qa_da_train", "dataset_name": "multi-wiki-qa-da", "loader": "euroeval", "config_name": "da", "split": "train", "domain": "knowledge", "language": "da", "adapter": "euroeval", "max_records": 4000},
+    {"name": "nordjylland_news_da_train", "dataset_name": "nordjylland-news", "loader": "euroeval", "split": "train", "data_file": "hf://datasets/alexandrainst/nordjylland-news-summarization/data/train-00000-of-00001-4fb110c0f6314175.parquet", "domain": "news", "language": "da", "adapter": "euroeval", "max_records": null},
+    {"name": "danske_talemaader_da_train", "dataset_name": "danske-talemaader", "loader": "euroeval", "split": "train", "domain": "knowledge", "language": "da", "adapter": "euroeval", "max_records": 1200},
+    {"name": "danish_citizen_tests_da_train", "dataset_name": "danish-citizen-tests", "loader": "euroeval", "split": "train", "domain": "knowledge", "language": "da", "adapter": "euroeval", "max_records": 480},
+    {"name": "hellaswag_da_train", "dataset_name": "hellaswag-da", "loader": "euroeval", "config_name": "da", "split": "val", "domain": "general", "language": "da", "adapter": "euroeval", "max_records": 7444}
   ],
   "eval": [
     {"name": "gsm8k_en_test", "dataset_name": "openai/gsm8k", "config_name": "main", "split": "test", "domain": "math", "language": "en", "adapter": "gsm8k", "native_id_field": "id", "max_records": null},
@@ -26,14 +26,14 @@
     {"name": "poetry_en_train_slice", "dataset_name": "merve/poetry", "split": "train", "start_idx": 100, "domain": "creative", "language": "en", "adapter": "poetry", "native_id_field": "id", "max_records": null},
 
     {"name": "angry_tweets_da_test", "dataset_name": "angry-tweets", "loader": "euroeval", "split": "test", "domain": "social", "language": "da", "adapter": "euroeval", "max_records": null},
-    {"name": "scala_da_test", "dataset_name": "scala-da", "loader": "euroeval", "split": "test", "domain": "linguistic_acceptability", "language": "da", "adapter": "euroeval", "max_records": null},
+    {"name": "scala_da_test", "dataset_name": "scala-da", "loader": "euroeval", "config_name": "da", "split": "test", "domain": "linguistic_acceptability", "language": "da", "adapter": "euroeval", "max_records": null},
     {"name": "dansk_da_test", "dataset_name": "dansk", "loader": "euroeval", "split": "test", "domain": "named_entities", "language": "da", "adapter": "euroeval", "max_records": null},
-    {"name": "multi_wiki_qa_da_test", "dataset_name": "multi-wiki-qa-da", "loader": "euroeval", "split": "test", "domain": "knowledge", "language": "da", "adapter": "euroeval", "max_records": null},
-    {"name": "nordjylland_news_da_test", "dataset_name": "nordjylland-news", "loader": "euroeval", "split": "test", "domain": "news", "language": "da", "adapter": "euroeval", "max_records": null},
-    {"name": "danske_talemaader_da_test", "dataset_name": "danske-talemaader", "loader": "euroeval", "split": "test", "domain": "knowledge", "language": "da", "adapter": "euroeval", "max_records": null},
-    {"name": "danish_citizen_tests_da_test", "dataset_name": "danish-citizen-tests", "loader": "euroeval", "split": "test", "domain": "knowledge", "language": "da", "adapter": "euroeval", "max_records": null},
-    {"name": "hellaswag_da_test", "dataset_name": "hellaswag-da", "loader": "euroeval", "split": "test", "domain": "general", "language": "da", "adapter": "euroeval", "max_records": null},
-    {"name": "ifeval_da_test", "dataset_name": "ifeval-da", "loader": "euroeval", "split": "test", "domain": "instruction_following", "language": "da", "adapter": "euroeval", "max_records": null},
-    {"name": "valeu_da_test", "dataset_name": "valeu-da", "loader": "euroeval", "split": "test", "domain": "values", "language": "da", "adapter": "euroeval", "max_records": null}
+    {"name": "multi_wiki_qa_da_test", "dataset_name": "multi-wiki-qa-da", "loader": "euroeval", "config_name": "da", "split": "train", "start_idx": 4000, "domain": "knowledge", "language": "da", "adapter": "euroeval", "max_records": 1000},
+    {"name": "nordjylland_news_da_test", "dataset_name": "nordjylland-news", "loader": "euroeval", "split": "test", "data_file": "hf://datasets/alexandrainst/nordjylland-news-summarization/data/test-00000-of-00001-fe5a9a4940bb3673.parquet", "domain": "news", "language": "da", "adapter": "euroeval", "max_records": null},
+    {"name": "danske_talemaader_da_test", "dataset_name": "danske-talemaader", "loader": "euroeval", "split": "train", "start_idx": 1200, "domain": "knowledge", "language": "da", "adapter": "euroeval", "max_records": 388},
+    {"name": "danish_citizen_tests_da_test", "dataset_name": "danish-citizen-tests", "loader": "euroeval", "split": "train", "start_idx": 480, "domain": "knowledge", "language": "da", "adapter": "euroeval", "max_records": 125},
+    {"name": "hellaswag_da_test", "dataset_name": "hellaswag-da", "loader": "euroeval", "config_name": "da", "split": "val", "start_idx": 7444, "domain": "general", "language": "da", "adapter": "euroeval", "max_records": 1861},
+    {"name": "ifeval_da_test", "dataset_name": "ifeval-da", "loader": "euroeval", "split": "train", "domain": "instruction_following", "language": "da", "adapter": "euroeval", "max_records": null},
+    {"name": "valeu_da_test", "dataset_name": "valeu-da", "loader": "euroeval", "split": "test", "domain": "values", "language": "da", "adapter": "euroeval", "max_records": null, "enabled": false}
   ]
 }
