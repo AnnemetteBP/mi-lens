@@ -365,18 +365,18 @@ def _configuration_mockup(output_dir: Path) -> list[str]:
         has_subplots=True,
     )
     # Keep the first panel close to the main title without moving the lower rows.
-    figure.update_layout(title=dict(y=0.99, font=dict(size=20, family="Arial, sans-serif", weight=600)))
+    figure.update_layout(title=dict(y=0.99, font=dict(size=22, family="Arial, sans-serif", weight=600)))
     figure.update_xaxes(
-        title_font=dict(size=18, family="Arial, sans-serif", weight=600),
+        title_font=dict(size=20, family="Arial, sans-serif", weight=600),
         tickfont=dict(size=17, family="Arial, sans-serif", weight=600),
     )
     figure.update_yaxes(
-        title_font=dict(size=18, family="Arial, sans-serif", weight=600),
-        tickfont=dict(size=17, family="Arial, sans-serif", weight=600),
+        title_font=dict(size=20, family="Arial, sans-serif", weight=600),
+        tickfont=dict(size=19, family="Arial, sans-serif", weight=600),
     )
     figure.layout.yaxis.domain = [float(figure.layout.yaxis.domain[0]), 0.935]
     for annotation in figure.layout.annotations or ():
-        annotation.font = dict(size=19, family="Arial, sans-serif", weight=600, color=INK)
+        annotation.font = dict(size=21, family="Arial, sans-serif", weight=600, color=INK)
     figure.layout.annotations[0].y = 0.96
     return _write(figure, output_dir, "03_router_configuration_summary_mock")
 
@@ -503,7 +503,7 @@ def _model_summary_mockups(output_dir: Path) -> list[str]:
                     thickness=16,
                     len=0.26,
                     y=0.205,
-                    x=0.48,
+                    x=0.44,
                 ),
                 showlegend=False,
             ),
@@ -533,7 +533,7 @@ def _model_summary_mockups(output_dir: Path) -> list[str]:
         _style(figure, f"{model_label}: router summary", height=820, has_subplots=True)
         figure.update_layout(
             title=dict(y=0.985, font=dict(size=22, family="Arial, sans-serif", weight=600)),
-            legend=dict(y=0.88, font=dict(size=19, family="Arial, sans-serif", weight=600)),
+            legend=dict(y=0.92, font=dict(size=19, family="Arial, sans-serif", weight=600)),
         )
         figure.update_xaxes(
             title_font=dict(size=20, family="Arial, sans-serif", weight=600),

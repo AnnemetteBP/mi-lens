@@ -10,6 +10,7 @@ from typing import Any
 
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import torch
 
 from .plotly_export import save_plotly_figure
 
@@ -40,6 +41,14 @@ _BLUE_HEATMAP = [
     [0.5, "#8FC7CE"],
     [0.76, "#3C8E9A"],
     [1.0, "#063F59"],
+]
+_DOMAIN_COLORS = [
+    "#063F59", "#287F8C", "#5CA7B1", "#8FC7CE", "#4B7586", "#6E98A3",
+    "#9C7B59", "#9B5B6A", "#6C7B45", "#765C91", "#BA6A36", "#537E6A",
+]
+_EXPERT_COLORS = [
+    "#063F59", "#287F8C", "#5CA7B1", "#4B7586", "#9C7B59", "#9B5B6A",
+    "#6C7B45", "#765C91", "#BA6A36", "#537E6A",
 ]
 _MODEL_DISPLAY_NAMES = {
     "flexolmo_7x7b_a2": "FlexOlmo-7x7B-1T-a2",
@@ -115,6 +124,7 @@ def _write_figure(
     height: int = 610,
     has_subplots: bool = False,
     legend_font_size: int = 14,
+    width: int = 1280,
 ) -> None:
     """Export one compact, paper-readable Plotly figure via Kaleido."""
 
@@ -128,7 +138,7 @@ def _write_figure(
         font=dict(family="Arial, sans-serif", size=15, color=_INK),
         paper_bgcolor=_PAPER_BG,
         plot_bgcolor=_PAPER_BG,
-        width=1280,
+        width=width,
         height=height,
         margin=dict(l=92, r=108, t=(72 if show_legend else 58), b=68),
         legend=dict(
@@ -613,6 +623,363 @@ def _router_distribution_figures(rows: list[dict[str, Any]], output_dir: Path) -
     return paths
 
 
+def _discrete_colorscale(colors: list[str]) -> list[list[object]]:
+    """Return a step scale so integer expert IDs remain categorical."""
+
+    if not colors:
+        raise ValueError("A categorical colourscale requires at least one colour.")
+    return [
+        point
+        for index, color in enumerate(colors)
+        for point in ([index / len(colors), color], [(index + 1) / len(colors), color])
+    ]
+
+
+def _load_router_neighbourhood(
+    summary_path: Path,
+    *,
+    max_tokens_per_domain: int = 250,
+) -> tuple[str, int, list[str], torch.Tensor, list[str], torch.Tensor]:
+    """Load a balanced held-out router-input sample for one projection figure."""
+
+    if max_tokens_per_domain < 2:
+        raise ValueError("max_tokens_per_domain must be at least two.")
+    payload = json.loads(summary_path.read_text(encoding="utf-8"))
+    if payload.get("format") != "mi_lens.routerinterp.analysis.v1":
+        raise ValueError(f"{summary_path} is not a RouterInterp analysis summary.")
+    eval_root = Path(str(payload.get("eval_artifacts_path", "")))
+    manifest_path = eval_root / "manifest.json"
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"Missing held-out router capture manifest: {manifest_path}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    layers = sorted(int(layer) for layer in payload.get("layers", {}))
+    if not layers:
+        raise ValueError(f"{summary_path} contains no analysed layers.")
+    layer = layers[len(layers) // 2]
+    expert_labels = [str(label) for label in payload.get("expert_labels", [])]
+    if not expert_labels:
+        raise ValueError(f"{summary_path} does not record expert labels.")
+
+    per_domain_counts: dict[str, int] = {}
+    inputs: list[torch.Tensor] = []
+    domains: list[str] = []
+    selected: list[torch.Tensor] = []
+    for record in manifest.get("prompts", []):
+        domain = str(record.get("domain", "")).strip()
+        if not domain or domain.lower() == "unknown":
+            raise ValueError("Router neighbourhood figures require an explicit dataset-domain label for every prompt.")
+        remaining = max_tokens_per_domain - per_domain_counts.get(domain, 0)
+        if remaining <= 0:
+            continue
+        capture_path = eval_root / str(record["path"])
+        if not capture_path.is_file():
+            raise FileNotFoundError(f"Missing held-out router capture: {capture_path}")
+        capture = torch.load(capture_path, map_location="cpu", weights_only=True)
+        layer_payload = capture.get("layers", {}).get(str(layer))
+        if layer_payload is None:
+            raise KeyError(f"{capture_path} has no router capture for layer {layer}.")
+        router_input = layer_payload.get("router_input")
+        selected_experts = layer_payload.get("selected_experts")
+        if not isinstance(router_input, torch.Tensor) or not isinstance(selected_experts, torch.Tensor):
+            raise TypeError(f"{capture_path} has malformed router capture tensors.")
+        if router_input.ndim != 2 or selected_experts.ndim != 2 or router_input.shape[0] != selected_experts.shape[0]:
+            raise ValueError(f"{capture_path} router inputs and selected experts have incompatible shapes.")
+        take = min(remaining, int(router_input.shape[0]))
+        if take == 0:
+            continue
+        ids = selected_experts[:take, 0].to(dtype=torch.long)
+        if ids.numel() and (int(ids.min()) < 0 or int(ids.max()) >= len(expert_labels)):
+            raise ValueError(f"{capture_path} contains an expert ID outside the recorded expert-label range.")
+        values = router_input[:take].to(dtype=torch.float32)
+        if not torch.isfinite(values).all():
+            raise ValueError(f"{capture_path} contains non-finite router inputs.")
+        inputs.append(values)
+        selected.append(ids)
+        domains.extend([domain] * take)
+        per_domain_counts[domain] = per_domain_counts.get(domain, 0) + take
+    if len(inputs) < 2:
+        raise ValueError("Router neighbourhood figures require at least two held-out captured prompts.")
+    router_inputs = torch.cat(inputs, dim=0)
+    expert_ids = torch.cat(selected, dim=0)
+    if router_inputs.shape[0] < 3:
+        raise ValueError("Router neighbourhood figures require at least three captured tokens.")
+    return _model_label(summary_path, payload), layer, expert_labels, router_inputs, domains, expert_ids
+
+
+def _pca_coordinates(router_inputs: torch.Tensor) -> torch.Tensor:
+    """Compute a checked two-dimensional PCA projection of router inputs."""
+
+    if router_inputs.ndim != 2 or min(router_inputs.shape) < 2:
+        raise ValueError("Two-dimensional PCA requires at least two tokens and two router-input dimensions.")
+    centered = router_inputs - router_inputs.mean(dim=0, keepdim=True)
+    _, _, vectors = torch.pca_lowrank(centered, q=2, center=False, niter=4)
+    coordinates = centered @ vectors[:, :2]
+    if not torch.isfinite(coordinates).all():
+        raise ValueError("Router-input PCA produced non-finite coordinates.")
+    return coordinates
+
+
+def _knn_region_labels(coordinates: torch.Tensor, expert_ids: torch.Tensor, n_experts: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Classify a PCA-plane grid by actual selected-expert nearest neighbours."""
+
+    if coordinates.ndim != 2 or coordinates.shape[1] != 2:
+        raise ValueError("kNN decision regions require two-dimensional coordinates.")
+    if expert_ids.shape != (coordinates.shape[0],):
+        raise ValueError("kNN decision regions require one selected expert ID per coordinate.")
+    lower = coordinates.min(dim=0).values
+    upper = coordinates.max(dim=0).values
+    span = (upper - lower).clamp_min(1e-5)
+    lower = lower - 0.08 * span
+    upper = upper + 0.08 * span
+    axis_x = torch.linspace(float(lower[0]), float(upper[0]), 90)
+    axis_y = torch.linspace(float(lower[1]), float(upper[1]), 90)
+    grid_y, grid_x = torch.meshgrid(axis_y, axis_x, indexing="ij")
+    query = torch.stack((grid_x.reshape(-1), grid_y.reshape(-1)), dim=1)
+    k = min(15, int(coordinates.shape[0]))
+    labels: list[torch.Tensor] = []
+    for start in range(0, int(query.shape[0]), 512):
+        distances = torch.cdist(query[start : start + 512], coordinates)
+        neighbours = expert_ids[distances.topk(k=k, largest=False).indices]
+        votes = torch.zeros((neighbours.shape[0], n_experts), dtype=torch.int64)
+        votes.scatter_add_(1, neighbours, torch.ones_like(neighbours, dtype=torch.int64))
+        labels.append(votes.argmax(dim=1))
+    return axis_x, axis_y, torch.cat(labels).reshape(grid_y.shape)
+
+
+def _router_neighbourhood_figures(summary_paths: list[Path], output_dir: Path) -> list[str]:
+    """Show observed domain structure and selected-expert regions in PCA space."""
+
+    paths: list[str] = []
+    for summary_path in summary_paths:
+        model, layer, expert_labels, router_inputs, domains, expert_ids = _load_router_neighbourhood(summary_path)
+        coordinates = _pca_coordinates(router_inputs)
+        axis_x, axis_y, region_labels = _knn_region_labels(coordinates, expert_ids, len(expert_labels))
+        domain_names = sorted(set(domains))
+        if len(domain_names) > len(_DOMAIN_COLORS):
+            raise ValueError("Add domain colours before plotting more than twelve dataset domains.")
+        domain_ids = [domain_names.index(domain) for domain in domains]
+        domain_figure = go.Figure()
+        domain_figure.add_trace(
+            go.Scatter(
+                x=coordinates[:, 0].tolist(),
+                y=coordinates[:, 1].tolist(),
+                customdata=domains,
+                mode="markers",
+                showlegend=False,
+                marker=dict(
+                    size=5,
+                    color=domain_ids,
+                    colorscale=_discrete_colorscale(_DOMAIN_COLORS[: len(domain_names)]),
+                    cmin=0,
+                    cmax=max(1, len(domain_names) - 1),
+                    showscale=True,
+                    opacity=0.70,
+                    colorbar=dict(
+                        title=dict(text="Dataset domain", side="right"),
+                        tickmode="array",
+                        tickvals=list(range(len(domain_names))),
+                        ticktext=domain_names,
+                        thickness=16,
+                    ),
+                ),
+                hovertemplate="domain=%{customdata}<br>PC 1=%{x:.2f}<br>PC 2=%{y:.2f}<extra></extra>",
+            )
+        )
+        domain_figure.update_xaxes(title="Router-input PC 1")
+        domain_figure.update_yaxes(title="Router-input PC 2")
+        domain_destination = output_dir / f"figure_router_domain_neighbourhood_{_safe_label(model)}_layer_{layer:02d}.html"
+        _write_figure(
+            domain_figure,
+            domain_destination,
+            f"Router-input neighbourhood by dataset domain: {model} (L{layer})",
+            height=700,
+            width=980,
+        )
+        paths.extend((str(domain_destination), str(domain_destination.with_suffix(".pdf"))))
+
+        colours = _EXPERT_COLORS[: len(expert_labels)]
+        if len(colours) < len(expert_labels):
+            raise ValueError("Add expert colours before plotting a model with more than ten experts.")
+        expert_figure = make_subplots(
+            rows=1,
+            cols=2,
+            subplot_titles=("Observed selected expert", "15-NN selected-expert regions"),
+            horizontal_spacing=0.12,
+        )
+        expert_figure.add_trace(
+            go.Scatter(
+                x=coordinates[:, 0].tolist(),
+                y=coordinates[:, 1].tolist(),
+                customdata=[expert_labels[int(expert)] for expert in expert_ids.tolist()],
+                mode="markers",
+                showlegend=False,
+                marker=dict(
+                    size=5,
+                    color=expert_ids.tolist(),
+                    colorscale=_discrete_colorscale(colours),
+                    cmin=0,
+                    cmax=max(1, len(expert_labels) - 1),
+                    showscale=False,
+                    opacity=0.70,
+                ),
+                hovertemplate="observed expert=%{customdata}<br>PC 1=%{x:.2f}<br>PC 2=%{y:.2f}<extra></extra>",
+            ),
+            row=1,
+            col=1,
+        )
+        expert_figure.add_trace(
+            go.Heatmap(
+                x=axis_x.tolist(),
+                y=axis_y.tolist(),
+                z=region_labels.tolist(),
+                zmin=0,
+                zmax=max(1, len(expert_labels) - 1),
+                colorscale=_discrete_colorscale(colours),
+                showscale=True,
+                opacity=0.48,
+                colorbar=dict(
+                    title=dict(text="15-NN expert", side="right"),
+                    tickmode="array",
+                    tickvals=list(range(len(expert_labels))),
+                    ticktext=expert_labels,
+                    thickness=16,
+                ),
+                hovertemplate="PC 1=%{x:.2f}<br>PC 2=%{y:.2f}<br>15-NN expert=%{z}<extra></extra>",
+            ),
+            row=1,
+            col=2,
+        )
+        for expert_id, label in enumerate(expert_labels):
+            mask = expert_ids == expert_id
+            if not bool(mask.any()):
+                continue
+            expert_figure.add_trace(
+                go.Scatter(
+                    x=coordinates[mask, 0].tolist(),
+                    y=coordinates[mask, 1].tolist(),
+                    mode="markers",
+                    name=label,
+                    showlegend=False,
+                    marker=dict(size=3.5, color=colours[expert_id], opacity=0.88, line=dict(width=0.2, color="#FFFFFF")),
+                    hovertemplate=f"observed expert={label}<br>PC 1=%{{x:.2f}}<br>PC 2=%{{y:.2f}}<extra></extra>",
+                ),
+                row=1,
+                col=2,
+            )
+        for column in range(1, 3):
+            expert_figure.update_xaxes(title="Router-input PC 1", row=1, col=column)
+            expert_figure.update_yaxes(title="Router-input PC 2", row=1, col=column)
+        expert_destination = output_dir / f"figure_router_expert_regions_{_safe_label(model)}_layer_{layer:02d}.html"
+        _write_figure(
+            expert_figure,
+            expert_destination,
+            f"Observed expert routing and 15-NN regions: {model} (L{layer})",
+            height=700,
+            has_subplots=True,
+            width=1220,
+        )
+        paths.extend((str(expert_destination), str(expert_destination.with_suffix(".pdf"))))
+    return paths
+
+
+def _feature_domain_profile_figures(summary_paths: list[Path], output_dir: Path) -> list[str]:
+    """Render observed broad-domain profiles for top routing-useful SAE latents."""
+
+    paths: list[str] = []
+    for summary_path in summary_paths:
+        payload = json.loads(summary_path.read_text(encoding="utf-8"))
+        if payload.get("format") != "mi_lens.routerinterp.analysis.v1":
+            raise ValueError(f"{summary_path} is not a RouterInterp analysis summary.")
+        layers = sorted(int(layer) for layer in payload.get("layers", {}))
+        if not layers:
+            continue
+        layer = layers[len(layers) // 2]
+        layer_result = payload["layers"][str(layer)]
+        profile_path = Path(str(layer_result.get("top_rho_domain_profile_artifact", "")))
+        if not profile_path.is_file():
+            raise FileNotFoundError(f"Missing top-rho feature-domain profile artifact: {profile_path}")
+        profile_rows = json.loads(profile_path.read_text(encoding="utf-8"))
+        if not profile_rows:
+            continue
+        model = _model_label(summary_path, payload)
+        domains = sorted({str(row["domain"]) for row in profile_rows})
+        if any(not domain or domain.lower() == "unknown" for domain in domains):
+            raise ValueError("Top-rho feature-domain figures require explicit dataset-domain labels.")
+        feature_groups: dict[tuple[int, str, int, int], list[dict[str, Any]]] = {}
+        for row in profile_rows:
+            share = _validate_metric(
+                "activation_mass_share",
+                row["activation_mass_share"],
+                context=f"{model}, layer {layer}, top-rho feature profile",
+            )
+            entropy = _validate_metric(
+                "normalized_domain_entropy",
+                row["normalized_domain_entropy"],
+                context=f"{model}, layer {layer}, top-rho feature profile",
+            )
+            if share < 0.0 or share > 1.0 or entropy < 0.0 or entropy > 1.0:
+                raise ValueError("Top-rho feature-domain metrics must be in [0, 1].")
+            key = (int(row["expert"]), str(row["expert_label"]), int(row["rho_rank"]), int(row["feature_id"]))
+            feature_groups.setdefault(key, []).append(row)
+        ordered = sorted(feature_groups.items(), key=lambda item: item[0])
+        y_labels = [f"{label}: f{feature_id}" for (_, label, _, feature_id), _ in ordered]
+        matrix: list[list[float]] = []
+        entropies: dict[str, list[float]] = {}
+        for (_, label, _, _), rows in ordered:
+            by_domain = {str(row["domain"]): float(row["activation_mass_share"]) for row in rows}
+            values = [by_domain.get(domain, 0.0) for domain in domains]
+            if not math.isclose(sum(values), 1.0, rel_tol=1e-5, abs_tol=1e-5):
+                raise ValueError("Top-rho feature-domain activation shares must sum to one per feature.")
+            matrix.append(values)
+            entropies.setdefault(label, []).append(float(rows[0]["normalized_domain_entropy"]))
+        figure = go.Figure(
+            go.Heatmap(
+                z=matrix,
+                x=domains,
+                y=y_labels,
+                colorscale=_BLUE_HEATMAP,
+                zmin=0,
+                zmax=1,
+                colorbar=dict(title=dict(text="Activation mass share", side="right"), tickformat=".0%", thickness=16),
+                hovertemplate="feature=%{y}<br>domain=%{x}<br>activation share=%{z:.3f}<extra></extra>",
+            )
+        )
+        figure.update_xaxes(title="Dataset domain", tickangle=-30)
+        figure.update_yaxes(title="Top-rho SAE feature", autorange="reversed")
+        destination = output_dir / f"figure_top_rho_feature_domain_profiles_{_safe_label(model)}_layer_{layer:02d}.html"
+        _write_figure(
+            figure,
+            destination,
+            f"Top-rho SAE feature profiles by dataset domain: {model} (L{layer})",
+            height=max(720, 220 + 20 * len(y_labels)),
+            width=1240,
+        )
+        paths.extend((str(destination), str(destination.with_suffix(".pdf"))))
+
+        labels = list(entropies)
+        diversity = [sum(entropies[label]) / len(entropies[label]) for label in labels]
+        diversity_figure = go.Figure(
+            go.Bar(
+                x=labels,
+                y=diversity,
+                marker_color=[_EXPERT_COLORS[index % len(_EXPERT_COLORS)] for index in range(len(labels))],
+                hovertemplate="expert=%{x}<br>mean feature-domain entropy=%{y:.3f}<extra></extra>",
+            )
+        )
+        diversity_figure.update_xaxes(title="Expert")
+        diversity_figure.update_yaxes(title="Mean normalized domain entropy", range=[0, 1], tickformat=".1f")
+        diversity_destination = output_dir / f"figure_top_rho_feature_domain_diversity_{_safe_label(model)}_layer_{layer:02d}.html"
+        _write_figure(
+            diversity_figure,
+            diversity_destination,
+            f"Broad-domain diversity of top-rho SAE features: {model} (L{layer})",
+            height=600,
+            width=980,
+        )
+        paths.extend((str(diversity_destination), str(diversity_destination.with_suffix(".pdf"))))
+    return paths
+
+
 def _model_summary_figures(
     routing_rows: list[dict[str, Any]],
     budget_rows: list[dict[str, Any]],
@@ -828,6 +1195,8 @@ def render_routerinterp_report(summary_paths: list[Path], output_dir: Path) -> d
     health_paths = _feature_health_figures(health_rows, output_dir)
     domain_paths = _domain_figures(domain_rows, output_dir)
     distribution_paths = _router_distribution_figures(distribution_rows, output_dir) if distribution_rows else []
+    neighbourhood_paths = _router_neighbourhood_figures(summary_paths, output_dir)
+    feature_profile_paths = _feature_domain_profile_figures(summary_paths, output_dir)
     model_summary_paths = _model_summary_figures(
         routing_rows,
         budget_rows,
@@ -853,6 +1222,8 @@ def render_routerinterp_report(summary_paths: list[Path], output_dir: Path) -> d
             *health_paths,
             *domain_paths,
             *distribution_paths,
+            *neighbourhood_paths,
+            *feature_profile_paths,
             *model_summary_paths,
         ],
     }
